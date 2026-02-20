@@ -134,3 +134,5 @@ cython_debug/
 # Saved models
 models/*.pkl
 models/*.joblib
+
+claude.md

@@ -3,46 +3,20 @@ Baseline Model: Linear Regression on Job-Level Features
 Phase 1 approach from claude.md
 """
 
-import pandas as pd
 import numpy as np
 from sklearn.linear_model import Ridge
 from sklearn.model_selection import cross_val_score
 from sklearn.preprocessing import StandardScaler
 import warnings
 
+from utils import (
+    load_data,
+    extract_date_features,
+    target_encode,
+    create_submission,
+)
+
 warnings.filterwarnings('ignore')
-
-DATA_DIR = "."
-
-
-def load_data():
-    """Load training and test data."""
-    train = pd.read_csv(f"{DATA_DIR}/train_summary.csv")
-    test = pd.read_csv(f"{DATA_DIR}/test.csv")
-    return train, test
-
-
-def extract_date_features(df):
-    """Extract features from bid_date."""
-    df = df.copy()
-    df['bid_date'] = pd.to_datetime(df['bid_date'])
-    df['year'] = df['bid_date'].dt.year
-    df['month'] = df['bid_date'].dt.month
-    df['day_of_year'] = df['bid_date'].dt.dayofyear
-    df['day_of_week'] = df['bid_date'].dt.dayofweek
-    return df
-
-
-def target_encode(train, test, col, target, smoothing=10):
-    """Apply target encoding with smoothing."""
-    global_mean = train[target].mean()
-    agg = train.groupby(col)[target].agg(['mean', 'count'])
-    smooth = (agg['count'] * agg['mean'] + smoothing * global_mean) / (agg['count'] + smoothing)
-
-    train_encoded = train[col].map(smooth).fillna(global_mean)
-    test_encoded = test[col].map(smooth).fillna(global_mean)
-
-    return train_encoded, test_encoded
 
 
 def prepare_features(train, test):
@@ -81,18 +55,6 @@ def prepare_features(train, test):
     return X_train, y.values, X_test, test['row_id']
 
 
-def rmsle(y_true, y_pred):
-    """Calculate RMSLE."""
-    return np.sqrt(np.mean((np.log1p(y_pred) - np.log1p(y_true)) ** 2))
-
-
-def rmsle_cv_score(y_true, y_pred_log):
-    """Calculate RMSLE from log predictions."""
-    y_pred = np.expm1(y_pred_log)
-    y_pred = np.maximum(y_pred, 0)
-    return rmsle(y_true, y_pred)
-
-
 def train_and_predict(X_train, y_train, X_test):
     """Train Ridge regression and generate predictions."""
     scaler = StandardScaler()
@@ -112,19 +74,6 @@ def train_and_predict(X_train, y_train, X_test):
     y_pred = np.maximum(y_pred, 0)  # Ensure non-negative
 
     return y_pred
-
-
-def create_submission(row_ids, predictions, filename="submission.csv"):
-    """Create submission file."""
-    submission = pd.DataFrame({
-        'row_id': row_ids,
-        'total_bid': predictions
-    })
-    submission.to_csv(filename, index=False)
-    print(f"Submission saved to {filename}")
-    print(f"  Shape: {submission.shape}")
-    print(f"  Predictions range: [{predictions.min():.2f}, {predictions.max():.2f}]")
-    return submission
 
 
 def main():

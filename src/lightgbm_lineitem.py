@@ -6,7 +6,8 @@ Uses quantity data and learned unit prices to estimate job costs
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, RandomizedSearchCV
+from scipy.stats import randint, uniform
 import warnings
 
 from utils import extract_date_features, create_submission
@@ -175,24 +176,109 @@ def prepare_features(train_agg, test_agg):
     return X_train, y.values, X_test, row_ids, feature_cols
 
 
-def train_and_predict_cv(train_raw, test_raw):
+def tune_hyperparameters(X_train, y_train, n_iter=30, sample_frac=0.2):
+    """
+    Tune LightGBM hyperparameters using RandomizedSearchCV.
+    Uses a subsample of data for faster tuning.
+    Returns the best parameters found.
+    """
+    # Subsample for faster tuning
+    if sample_frac < 1.0:
+        n_samples = int(len(X_train) * sample_frac)
+        np.random.seed(42)
+        idx = np.random.choice(len(X_train), n_samples, replace=False)
+        X_tune = X_train.iloc[idx]
+        y_tune = y_train[idx]
+        print(f"\nTuning on {n_samples:,} samples ({sample_frac:.0%} of data)")
+    else:
+        X_tune, y_tune = X_train, y_train
+
+    print(f"Running {n_iter} iterations × 3 folds = {n_iter * 3} fits...")
+
+    param_dist = {
+        'num_leaves': randint(31, 96),
+        'max_depth': randint(4, 10),
+        'learning_rate': uniform(0.03, 0.12),  # 0.03 to 0.15
+        'n_estimators': randint(200, 500),
+        'min_child_samples': randint(10, 50),
+        'subsample': uniform(0.6, 0.35),  # 0.6 to 0.95
+        'colsample_bytree': uniform(0.6, 0.35),  # 0.6 to 0.95
+        'reg_alpha': uniform(0, 2),
+        'reg_lambda': uniform(0, 2),
+    }
+
+    base_model = lgb.LGBMRegressor(
+        objective='regression',
+        boosting_type='gbdt',
+        verbose=-1,
+        n_jobs=-1,
+        random_state=42
+    )
+
+    search = RandomizedSearchCV(
+        base_model,
+        param_distributions=param_dist,
+        n_iter=n_iter,
+        cv=3,
+        scoring='neg_root_mean_squared_error',
+        random_state=42,
+        verbose=2,
+        n_jobs=1  # Avoid nested parallelism issues
+    )
+
+    search.fit(X_tune, y_tune)
+
+    print(f"\nBest CV RMSE: {-search.best_score_:.4f}")
+    print("\nBest parameters:")
+    for k, v in search.best_params_.items():
+        if isinstance(v, float):
+            print(f"  {k}: {v:.4f}")
+        else:
+            print(f"  {k}: {v}")
+
+    return search.best_params_
+
+
+def train_and_predict_cv(train_raw, test_raw, tuned_params=None):
     """
     Train LightGBM with proper CV - build price lookup only from training fold.
     This avoids data leakage from validation fold contributing to price estimates.
     """
-    params = {
-        'objective': 'regression',
-        'metric': 'rmse',
-        'boosting_type': 'gbdt',
-        'num_leaves': 63,
-        'learning_rate': 0.05,
-        'feature_fraction': 0.8,
-        'bagging_fraction': 0.8,
-        'bagging_freq': 5,
-        'verbose': -1,
-        'seed': 42,
-        'n_jobs': -1
-    }
+    if tuned_params:
+        params = {
+            'objective': 'regression',
+            'metric': 'rmse',
+            'boosting_type': 'gbdt',
+            'verbose': -1,
+            'seed': 42,
+            'n_jobs': -1,
+            # Map sklearn API params to lgb.train params
+            'num_leaves': tuned_params.get('num_leaves', 63),
+            'max_depth': tuned_params.get('max_depth', -1),
+            'learning_rate': tuned_params.get('learning_rate', 0.05),
+            'min_child_samples': tuned_params.get('min_child_samples', 20),
+            'feature_fraction': tuned_params.get('colsample_bytree', 0.8),
+            'bagging_fraction': tuned_params.get('subsample', 0.8),
+            'bagging_freq': 5,
+            'lambda_l1': tuned_params.get('reg_alpha', 0),
+            'lambda_l2': tuned_params.get('reg_lambda', 0),
+        }
+        num_boost_round = tuned_params.get('n_estimators', 1000)
+    else:
+        params = {
+            'objective': 'regression',
+            'metric': 'rmse',
+            'boosting_type': 'gbdt',
+            'num_leaves': 63,
+            'learning_rate': 0.05,
+            'feature_fraction': 0.8,
+            'bagging_fraction': 0.8,
+            'bagging_freq': 5,
+            'verbose': -1,
+            'seed': 42,
+            'n_jobs': -1
+        }
+        num_boost_round = 2000
 
     # Get unique job+contractor combinations for CV splitting
     job_keys = train_raw.groupby(['job_id', 'contractor_id']).size().reset_index()[['job_id', 'contractor_id']]
@@ -239,7 +325,7 @@ def train_and_predict_cv(train_raw, test_raw):
         model = lgb.train(
             params,
             train_data,
-            num_boost_round=2000,
+            num_boost_round=num_boost_round,
             valid_sets=[val_data],
             callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)]
         )
@@ -275,7 +361,7 @@ def train_and_predict_cv(train_raw, test_raw):
 
     # Train final model
     train_data = lgb.Dataset(X_train, label=y_train)
-    final_model = lgb.train(params, train_data, num_boost_round=1000)
+    final_model = lgb.train(params, train_data, num_boost_round=num_boost_round)
 
     predictions_log = final_model.predict(X_test)
     predictions = np.expm1(predictions_log)
@@ -284,17 +370,36 @@ def train_and_predict_cv(train_raw, test_raw):
     return predictions, row_ids
 
 
-def main():
+def main(tune=False, n_iter=50):
     print("Loading raw data...")
     train_raw, test_raw = load_raw_data()
     print(f"  Train: {train_raw.shape}, Test: {test_raw.shape}")
 
+    tuned_params = None
+    if tune:
+        # Prepare data for tuning (uses all training data for price lookup)
+        print("\nPreparing data for hyperparameter tuning...")
+        item_prices, cat_prices, unit_prices = build_unit_price_lookup(train_raw)
+        train_est = estimate_line_item_cost(train_raw.copy(), item_prices, cat_prices, unit_prices)
+        test_est = estimate_line_item_cost(test_raw.copy(), item_prices, cat_prices, unit_prices)
+
+        train_agg = aggregate_job_features(train_est, is_train=True)
+        test_agg = aggregate_job_features(test_est, is_train=False)
+
+        X_train, y_train, _, _, _ = prepare_features(train_agg, test_agg)
+        tuned_params = tune_hyperparameters(X_train, y_train, n_iter=n_iter, sample_frac=0.2)
+
     print("\nTraining with proper CV (no leakage)...")
-    predictions, row_ids = train_and_predict_cv(train_raw, test_raw)
+    predictions, row_ids = train_and_predict_cv(train_raw, test_raw, tuned_params=tuned_params)
 
     print("\nCreating submission...")
     create_submission(row_ids, predictions, filename="submission_lgbm_lineitem.csv")
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--tune', action='store_true', help='Run hyperparameter tuning')
+    parser.add_argument('--n-iter', type=int, default=30, help='Number of tuning iterations')
+    args = parser.parse_args()
+    main(tune=args.tune, n_iter=args.n_iter)

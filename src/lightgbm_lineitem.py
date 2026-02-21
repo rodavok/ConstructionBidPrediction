@@ -10,51 +10,65 @@ from sklearn.model_selection import KFold, RandomizedSearchCV
 from scipy.stats import randint, uniform
 import warnings
 
-from utils import extract_date_features, create_submission
+from utils import extract_date_features, create_submission, add_inflation_features, load_cpi_data
 
 warnings.filterwarnings('ignore')
 
 
 def load_raw_data():
     """Load raw line-item data."""
-    train = pd.read_csv("../raw_train.csv")
-    test = pd.read_csv("../raw_test.csv")
+    train = pd.read_csv("./raw_train.csv")
+    test = pd.read_csv("./raw_test.csv")
     return train, test
 
 
-def build_unit_price_lookup(train_df):
+def build_unit_price_lookup(train_df, reference_date=None):
     """
     Build lookup table of unit prices from training data.
     Groups by pay_item_description + unit_english_id for granular pricing.
+
+    Prices are inflation-adjusted to reference_date for consistency.
     """
     train_df = train_df.copy()
+
+    # Add inflation adjustment
+    train_df = add_inflation_features(train_df, reference_date)
+
     train_df['unit_price'] = train_df['amount'] / train_df['quantity'].replace(0, np.nan)
 
+    # Adjust unit prices for inflation (scale to reference date)
+    train_df['unit_price_adjusted'] = train_df['unit_price'] * train_df['inflation_factor']
+
     # Filter out extreme outliers and invalid prices
-    valid = train_df['unit_price'].notna() & (train_df['unit_price'] > 0) & (train_df['unit_price'] < 1e7)
+    valid = train_df['unit_price_adjusted'].notna() & (train_df['unit_price_adjusted'] > 0) & (train_df['unit_price_adjusted'] < 1e7)
     train_df = train_df[valid]
 
-    # Granular: by pay_item + unit
-    item_unit_prices = train_df.groupby(['pay_item_description', 'unit_english_id'])['unit_price'].agg(['median', 'count'])
+    # Granular: by pay_item + unit (using inflation-adjusted prices)
+    item_unit_prices = train_df.groupby(['pay_item_description', 'unit_english_id'])['unit_price_adjusted'].agg(['median', 'count'])
     item_unit_prices.columns = ['price_item_unit', 'count_item_unit']
 
     # Fallback: by category + unit
-    cat_unit_prices = train_df.groupby(['category_description', 'unit_english_id'])['unit_price'].median()
+    cat_unit_prices = train_df.groupby(['category_description', 'unit_english_id'])['unit_price_adjusted'].median()
     cat_unit_prices.name = 'price_cat_unit'
 
     # Global fallback: by unit only
-    unit_prices = train_df.groupby('unit_english_id')['unit_price'].median()
+    unit_prices = train_df.groupby('unit_english_id')['unit_price_adjusted'].median()
     unit_prices.name = 'price_unit'
 
     return item_unit_prices, cat_unit_prices, unit_prices
 
 
-def estimate_line_item_cost(df, item_unit_prices, cat_unit_prices, unit_prices, min_count=5):
+def estimate_line_item_cost(df, item_unit_prices, cat_unit_prices, unit_prices, reference_date=None, min_count=5):
     """
     Estimate cost for each line item using learned unit prices.
     Uses hierarchical fallback: item+unit -> category+unit -> unit only
+
+    Lookup prices are at reference_date level; we scale estimates to each bid's date.
     """
     df = df.copy()
+
+    # Add inflation features to get adjustment factor for each row
+    df = add_inflation_features(df, reference_date)
 
     # Merge item+unit prices
     df = df.merge(item_unit_prices, left_on=['pay_item_description', 'unit_english_id'],
@@ -70,11 +84,18 @@ def estimate_line_item_cost(df, item_unit_prices, cat_unit_prices, unit_prices, 
     # Merge unit fallback
     df = df.merge(unit_prices, left_on='unit_english_id', right_index=True, how='left')
 
-    # Hierarchical price selection
-    df['estimated_unit_price'] = df['price_item_unit'].fillna(df['price_cat_unit']).fillna(df['price_unit'])
+    # Hierarchical price selection (these are at reference_date price level)
+    df['estimated_unit_price_ref'] = df['price_item_unit'].fillna(df['price_cat_unit']).fillna(df['price_unit'])
 
-    # Estimate cost
+    # Scale estimate to the bid's actual date (divide by inflation_factor to go from reference -> bid date)
+    # If inflation_factor > 1, bid was in past, so prices were lower -> divide
+    df['estimated_unit_price'] = df['estimated_unit_price_ref'] / df['inflation_factor']
+
+    # Estimate cost at bid date price level
     df['estimated_cost'] = df['quantity'] * df['estimated_unit_price']
+
+    # Also keep the reference-date cost for comparison
+    df['estimated_cost_ref'] = df['quantity'] * df['estimated_unit_price_ref']
 
     return df
 
@@ -99,6 +120,13 @@ def aggregate_job_features(df, is_train=True):
         # Estimated cost aggregations
         'estimated_cost': ['sum', 'mean', 'std'],
         'estimated_unit_price': ['mean', 'std'],
+
+        # Inflation-adjusted cost (at reference date prices)
+        'estimated_cost_ref': ['sum', 'mean'],
+
+        # Inflation features
+        'inflation_factor': 'first',  # Same for all items in a bid
+        'cpi_at_bid': 'first',
     }
 
     if is_train:
@@ -239,11 +267,20 @@ def tune_hyperparameters(X_train, y_train, n_iter=30, sample_frac=0.2):
     return search.best_params_
 
 
-def train_and_predict_cv(train_raw, test_raw, tuned_params=None):
+def train_and_predict_cv(train_raw, test_raw, tuned_params=None, reference_date=None):
     """
     Train LightGBM with proper CV - build price lookup only from training fold.
     This avoids data leakage from validation fold contributing to price estimates.
+
+    Args:
+        reference_date: Date to normalize all prices to (default: latest CPI date)
     """
+    # Use a consistent reference date for inflation adjustment
+    if reference_date is None:
+        cpi_data = load_cpi_data()
+        reference_date = str(cpi_data.index.max())
+        print(f"Using reference date for inflation: {reference_date}")
+
     if tuned_params:
         params = {
             'objective': 'regression',
@@ -299,11 +336,11 @@ def train_and_predict_cv(train_raw, test_raw, tuned_params=None):
         val_fold = train_raw[train_raw['key'].isin(val_keys)].copy()
 
         # Build price lookup ONLY from training fold (no leakage!)
-        item_prices, cat_prices, unit_prices = build_unit_price_lookup(train_fold)
+        item_prices, cat_prices, unit_prices = build_unit_price_lookup(train_fold, reference_date)
 
         # Estimate costs using training-fold prices
-        train_fold = estimate_line_item_cost(train_fold, item_prices, cat_prices, unit_prices)
-        val_fold = estimate_line_item_cost(val_fold, item_prices, cat_prices, unit_prices)
+        train_fold = estimate_line_item_cost(train_fold, item_prices, cat_prices, unit_prices, reference_date)
+        val_fold = estimate_line_item_cost(val_fold, item_prices, cat_prices, unit_prices, reference_date)
 
         # Aggregate to job level
         train_agg = aggregate_job_features(train_fold, is_train=True)
@@ -340,9 +377,9 @@ def train_and_predict_cv(train_raw, test_raw, tuned_params=None):
 
     # For final predictions, use all training data
     print("\nTraining final model on all data...")
-    item_prices, cat_prices, unit_prices = build_unit_price_lookup(train_raw)
-    train_raw_est = estimate_line_item_cost(train_raw.copy(), item_prices, cat_prices, unit_prices)
-    test_raw_est = estimate_line_item_cost(test_raw.copy(), item_prices, cat_prices, unit_prices)
+    item_prices, cat_prices, unit_prices = build_unit_price_lookup(train_raw, reference_date)
+    train_raw_est = estimate_line_item_cost(train_raw.copy(), item_prices, cat_prices, unit_prices, reference_date)
+    test_raw_est = estimate_line_item_cost(test_raw.copy(), item_prices, cat_prices, unit_prices, reference_date)
 
     train_agg = aggregate_job_features(train_raw_est, is_train=True)
     test_agg = aggregate_job_features(test_raw_est, is_train=False)
@@ -375,13 +412,18 @@ def main(tune=False, n_iter=50):
     train_raw, test_raw = load_raw_data()
     print(f"  Train: {train_raw.shape}, Test: {test_raw.shape}")
 
+    # Use consistent reference date
+    cpi_data = load_cpi_data()
+    reference_date = str(cpi_data.index.max())
+    print(f"Inflation reference date: {reference_date}")
+
     tuned_params = None
     if tune:
         # Prepare data for tuning (uses all training data for price lookup)
         print("\nPreparing data for hyperparameter tuning...")
-        item_prices, cat_prices, unit_prices = build_unit_price_lookup(train_raw)
-        train_est = estimate_line_item_cost(train_raw.copy(), item_prices, cat_prices, unit_prices)
-        test_est = estimate_line_item_cost(test_raw.copy(), item_prices, cat_prices, unit_prices)
+        item_prices, cat_prices, unit_prices = build_unit_price_lookup(train_raw, reference_date)
+        train_est = estimate_line_item_cost(train_raw.copy(), item_prices, cat_prices, unit_prices, reference_date)
+        test_est = estimate_line_item_cost(test_raw.copy(), item_prices, cat_prices, unit_prices, reference_date)
 
         train_agg = aggregate_job_features(train_est, is_train=True)
         test_agg = aggregate_job_features(test_est, is_train=False)
@@ -390,7 +432,7 @@ def main(tune=False, n_iter=50):
         tuned_params = tune_hyperparameters(X_train, y_train, n_iter=n_iter, sample_frac=0.2)
 
     print("\nTraining with proper CV (no leakage)...")
-    predictions, row_ids = train_and_predict_cv(train_raw, test_raw, tuned_params=tuned_params)
+    predictions, row_ids = train_and_predict_cv(train_raw, test_raw, tuned_params=tuned_params, reference_date=reference_date)
 
     print("\nCreating submission...")
     create_submission(row_ids, predictions, filename="submission_lgbm_lineitem.csv")

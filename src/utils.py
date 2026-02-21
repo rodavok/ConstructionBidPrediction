@@ -4,8 +4,101 @@ Shared utilities for construction price prediction models.
 
 import pandas as pd
 import numpy as np
+from pathlib import Path
 
 DATA_DIR = "."
+CPI_FILE = Path(__file__).parent.parent / "data" / "cpi_monthly.csv"
+
+
+def load_cpi_data():
+    """Load monthly CPI data."""
+    cpi = pd.read_csv(CPI_FILE)
+    cpi['date'] = pd.to_datetime(cpi['date'])
+    cpi['year_month'] = cpi['date'].dt.to_period('M')
+    return cpi.set_index('year_month')['cpi']
+
+
+def get_inflation_factor(df, reference_date=None):
+    """
+    Calculate inflation adjustment factor for each row.
+
+    Adjusts prices from bid_date to reference_date (default: latest date in CPI data).
+    Factor > 1 means prices need to be scaled up (older bids).
+
+    Args:
+        df: DataFrame with 'bid_date' column
+        reference_date: Target date for adjustment (default: latest CPI date)
+
+    Returns:
+        Series of inflation factors
+    """
+    cpi_data = load_cpi_data()
+
+    if reference_date is None:
+        reference_date = cpi_data.index.max()
+    else:
+        reference_date = pd.Period(reference_date, freq='M')
+
+    reference_cpi = cpi_data[reference_date]
+
+    # Get year-month for each bid
+    df = df.copy()
+    df['bid_date'] = pd.to_datetime(df['bid_date'])
+    bid_periods = df['bid_date'].dt.to_period('M')
+
+    # Map to CPI values (forward-fill for any missing months)
+    bid_cpi = bid_periods.map(cpi_data)
+
+    # Handle missing CPI values by using nearest available
+    if bid_cpi.isna().any():
+        # For dates beyond our CPI data, use the last known value
+        latest_cpi = cpi_data.iloc[-1]
+        bid_cpi = bid_cpi.fillna(latest_cpi)
+
+    # Inflation factor: reference_cpi / bid_cpi
+    # Older bids (lower CPI) get factor > 1 to scale up
+    inflation_factor = reference_cpi / bid_cpi
+
+    return inflation_factor
+
+
+def add_inflation_features(df, reference_date=None):
+    """
+    Add inflation-related features to DataFrame.
+
+    Args:
+        df: DataFrame with 'bid_date' column
+        reference_date: Target date for adjustment
+
+    Returns:
+        DataFrame with added columns:
+        - inflation_factor: multiplier to adjust prices to reference date
+        - cpi_at_bid: CPI value at time of bid
+    """
+    cpi_data = load_cpi_data()
+
+    if reference_date is None:
+        reference_date = cpi_data.index.max()
+    else:
+        reference_date = pd.Period(reference_date, freq='M')
+
+    reference_cpi = cpi_data[reference_date]
+
+    df = df.copy()
+    df['bid_date'] = pd.to_datetime(df['bid_date'])
+    bid_periods = df['bid_date'].dt.to_period('M')
+
+    # Map to CPI values
+    df['cpi_at_bid'] = bid_periods.map(cpi_data)
+
+    # Fill missing with latest known CPI
+    if df['cpi_at_bid'].isna().any():
+        latest_cpi = cpi_data.iloc[-1]
+        df['cpi_at_bid'] = df['cpi_at_bid'].fillna(latest_cpi)
+
+    df['inflation_factor'] = reference_cpi / df['cpi_at_bid']
+
+    return df
 
 
 def load_data():

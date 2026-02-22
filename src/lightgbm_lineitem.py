@@ -6,7 +6,7 @@ Uses quantity data and learned unit prices to estimate job costs
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-from sklearn.model_selection import KFold, RandomizedSearchCV
+from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit, KFold
 from scipy.stats import randint, uniform
 import warnings
 
@@ -204,24 +204,32 @@ def prepare_features(train_agg, test_agg):
     return X_train, y.values, X_test, row_ids, feature_cols
 
 
-def tune_hyperparameters(X_train, y_train, n_iter=30, sample_frac=0.2):
+def tune_hyperparameters(X_train, y_train, bid_dates=None, n_iter=30, n_splits=3, time_based_cv=True):
     """
     Tune LightGBM hyperparameters using RandomizedSearchCV.
-    Uses a subsample of data for faster tuning.
-    Returns the best parameters found.
-    """
-    # Subsample for faster tuning
-    if sample_frac < 1.0:
-        n_samples = int(len(X_train) * sample_frac)
-        np.random.seed(42)
-        idx = np.random.choice(len(X_train), n_samples, replace=False)
-        X_tune = X_train.iloc[idx]
-        y_tune = y_train[idx]
-        print(f"\nTuning on {n_samples:,} samples ({sample_frac:.0%} of data)")
-    else:
-        X_tune, y_tune = X_train, y_train
 
-    print(f"Running {n_iter} iterations × 3 folds = {n_iter * 3} fits...")
+    Args:
+        time_based_cv: If True, use TimeSeriesSplit (requires bid_dates).
+                       If False, use random KFold.
+    """
+    if time_based_cv and bid_dates is not None:
+        # Sort by date for time-based CV
+        bid_dates = pd.to_datetime(bid_dates)
+        sort_idx = bid_dates.argsort()
+        X_tune = X_train.iloc[sort_idx].reset_index(drop=True)
+        y_tune = y_train[sort_idx]
+        cv = TimeSeriesSplit(n_splits=n_splits)
+        cv_type = "time-based"
+        print(f"\nTuning on {len(X_tune):,} samples with time-based CV")
+        print(f"Date range: {bid_dates.min().date()} to {bid_dates.max().date()}")
+    else:
+        X_tune = X_train
+        y_tune = y_train
+        cv = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+        cv_type = "random"
+        print(f"\nTuning on {len(X_tune):,} samples with random CV")
+
+    print(f"Running {n_iter} iterations × {n_splits} folds = {n_iter * n_splits} fits...")
 
     param_dist = {
         'num_leaves': randint(31, 96),
@@ -247,7 +255,7 @@ def tune_hyperparameters(X_train, y_train, n_iter=30, sample_frac=0.2):
         base_model,
         param_distributions=param_dist,
         n_iter=n_iter,
-        cv=3,
+        cv=cv,
         scoring='neg_root_mean_squared_error',
         random_state=42,
         verbose=2,
@@ -267,13 +275,14 @@ def tune_hyperparameters(X_train, y_train, n_iter=30, sample_frac=0.2):
     return search.best_params_
 
 
-def train_and_predict_cv(train_raw, test_raw, tuned_params=None, reference_date=None):
+def train_and_predict_cv(train_raw, test_raw, tuned_params=None, reference_date=None, time_based_cv=True):
     """
     Train LightGBM with proper CV - build price lookup only from training fold.
     This avoids data leakage from validation fold contributing to price estimates.
 
     Args:
         reference_date: Date to normalize all prices to (default: latest CPI date)
+        time_based_cv: If True, use TimeSeriesSplit. If False, use random KFold.
     """
     # Use a consistent reference date for inflation adjustment
     if reference_date is None:
@@ -317,18 +326,40 @@ def train_and_predict_cv(train_raw, test_raw, tuned_params=None, reference_date=
         }
         num_boost_round = 2000
 
-    # Get unique job+contractor combinations for CV splitting
-    job_keys = train_raw.groupby(['job_id', 'contractor_id']).size().reset_index()[['job_id', 'contractor_id']]
+    # Get unique job+contractor combinations with their bid dates
+    train_raw['bid_date_parsed'] = pd.to_datetime(train_raw['bid_date'])
+    job_keys = train_raw.groupby(['job_id', 'contractor_id']).agg({
+        'bid_date_parsed': 'first'
+    }).reset_index()
     job_keys['key'] = job_keys['job_id'] + '__' + job_keys['contractor_id']
 
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    # Set up CV strategy
+    if time_based_cv:
+        # Sort by date for time-based CV
+        job_keys = job_keys.sort_values('bid_date_parsed').reset_index(drop=True)
+        cv = TimeSeriesSplit(n_splits=5)
+        print("Time-based CV folds:")
+    else:
+        cv = KFold(n_splits=5, shuffle=True, random_state=42)
+        print("Random CV folds:")
+
     cv_scores = []
     models = []
     feature_cols = None
 
-    for fold, (train_idx, val_idx) in enumerate(kf.split(job_keys)):
-        train_keys = set(job_keys.iloc[train_idx]['key'])
-        val_keys = set(job_keys.iloc[val_idx]['key'])
+    for fold, (train_idx, val_idx) in enumerate(cv.split(job_keys)):
+        train_keys_df = job_keys.iloc[train_idx]
+        val_keys_df = job_keys.iloc[val_idx]
+
+        if time_based_cv:
+            train_date_range = f"{train_keys_df['bid_date_parsed'].min().date()} to {train_keys_df['bid_date_parsed'].max().date()}"
+            val_date_range = f"{val_keys_df['bid_date_parsed'].min().date()} to {val_keys_df['bid_date_parsed'].max().date()}"
+            print(f"  Fold {fold+1}: Train {train_date_range} ({len(train_idx):,} jobs) -> Val {val_date_range} ({len(val_idx):,} jobs)")
+        else:
+            print(f"  Fold {fold+1}: Train {len(train_idx):,} jobs -> Val {len(val_idx):,} jobs")
+
+        train_keys = set(train_keys_df['key'])
+        val_keys = set(val_keys_df['key'])
 
         # Split raw data by job keys
         train_raw['key'] = train_raw['job_id'] + '__' + train_raw['contractor_id']
@@ -407,7 +438,7 @@ def train_and_predict_cv(train_raw, test_raw, tuned_params=None, reference_date=
     return predictions, row_ids
 
 
-def main(tune=False, n_iter=50):
+def main(tune=False, n_iter=50, time_based_cv=True):
     print("Loading raw data...")
     train_raw, test_raw = load_raw_data()
     print(f"  Train: {train_raw.shape}, Test: {test_raw.shape}")
@@ -416,6 +447,7 @@ def main(tune=False, n_iter=50):
     cpi_data = load_cpi_data()
     reference_date = str(cpi_data.index.max())
     print(f"Inflation reference date: {reference_date}")
+    print(f"CV strategy: {'time-based' if time_based_cv else 'random'}")
 
     tuned_params = None
     if tune:
@@ -428,11 +460,15 @@ def main(tune=False, n_iter=50):
         train_agg = aggregate_job_features(train_est, is_train=True)
         test_agg = aggregate_job_features(test_est, is_train=False)
 
-        X_train, y_train, _, _, _ = prepare_features(train_agg, test_agg)
-        tuned_params = tune_hyperparameters(X_train, y_train, n_iter=n_iter, sample_frac=0.2)
+        # Keep bid_date before prepare_features drops it
+        bid_dates = train_agg['bid_date_first']
 
-    print("\nTraining with proper CV (no leakage)...")
-    predictions, row_ids = train_and_predict_cv(train_raw, test_raw, tuned_params=tuned_params, reference_date=reference_date)
+        X_train, y_train, _, _, _ = prepare_features(train_agg, test_agg)
+        tuned_params = tune_hyperparameters(X_train, y_train, bid_dates, n_iter=n_iter, time_based_cv=time_based_cv)
+
+    print("\nTraining with CV...")
+    predictions, row_ids = train_and_predict_cv(train_raw, test_raw, tuned_params=tuned_params,
+                                                 reference_date=reference_date, time_based_cv=time_based_cv)
 
     print("\nCreating submission...")
     create_submission(row_ids, predictions, filename="submission_lgbm_lineitem.csv")
@@ -443,5 +479,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--tune', action='store_true', help='Run hyperparameter tuning')
     parser.add_argument('--n-iter', type=int, default=30, help='Number of tuning iterations')
+    parser.add_argument('--random-cv', action='store_true', help='Use random CV instead of time-based CV')
     args = parser.parse_args()
-    main(tune=args.tune, n_iter=args.n_iter)
+    main(tune=args.tune, n_iter=args.n_iter, time_based_cv=not args.random_cv)

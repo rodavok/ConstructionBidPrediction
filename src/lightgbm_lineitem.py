@@ -1,11 +1,11 @@
 """
-LightGBM Model with Line-Item Features
+Gradient Boosting Model with Line-Item Features
 Uses quantity data and learned unit prices to estimate job costs
+Supports LightGBM, XGBoost, and CatBoost
 """
 
 import numpy as np
 import pandas as pd
-import lightgbm as lgb
 from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit, KFold
 from scipy.stats import randint, uniform
 import warnings
@@ -19,9 +19,292 @@ mlflow.set_experiment("construction-price-prediction")
 
 
 # =============================================================================
+# MODEL BACKENDS
+# =============================================================================
+
+def get_lightgbm_backend():
+    import lightgbm as lgb
+
+    def get_default_params(config):
+        return {
+            'objective': 'regression',
+            'metric': 'rmse',
+            'boosting_type': 'gbdt',
+            'num_leaves': config['num_leaves'],
+            'learning_rate': config['learning_rate'],
+            'feature_fraction': 0.8,
+            'bagging_fraction': 0.8,
+            'bagging_freq': 5,
+            'verbose': -1,
+            'seed': 42,
+            'n_jobs': -1
+        }
+
+    def get_tuned_params(tuned):
+        return {
+            'objective': 'regression',
+            'metric': 'rmse',
+            'boosting_type': 'gbdt',
+            'verbose': -1,
+            'seed': 42,
+            'n_jobs': -1,
+            'num_leaves': tuned.get('num_leaves', 63),
+            'max_depth': tuned.get('max_depth', -1),
+            'learning_rate': tuned.get('learning_rate', 0.05),
+            'min_child_samples': tuned.get('min_child_samples', 20),
+            'feature_fraction': tuned.get('colsample_bytree', 0.8),
+            'bagging_fraction': tuned.get('subsample', 0.8),
+            'bagging_freq': 5,
+            'lambda_l1': tuned.get('reg_alpha', 0),
+            'lambda_l2': tuned.get('reg_lambda', 0),
+        }
+
+    def get_tune_distributions():
+        return {
+            'num_leaves': randint(31, 96),
+            'max_depth': randint(4, 10),
+            'learning_rate': uniform(0.03, 0.12),
+            'n_estimators': randint(200, 500),
+            'min_child_samples': randint(10, 50),
+            'subsample': uniform(0.6, 0.35),
+            'colsample_bytree': uniform(0.6, 0.35),
+            'reg_alpha': uniform(0, 2),
+            'reg_lambda': uniform(0, 2),
+        }
+
+    def get_tuning_model():
+        return lgb.LGBMRegressor(
+            objective='regression',
+            boosting_type='gbdt',
+            verbose=-1,
+            n_jobs=-1,
+            random_state=42
+        )
+
+    def train(X_tr, y_tr, X_val, y_val, params, num_boost_round):
+        train_data = lgb.Dataset(X_tr, label=y_tr)
+        val_data = lgb.Dataset(X_val, label=y_val)
+        model = lgb.train(
+            params,
+            train_data,
+            num_boost_round=num_boost_round,
+            valid_sets=[val_data],
+            callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)]
+        )
+        return model
+
+    def train_final(X_train, y_train, params, num_boost_round):
+        train_data = lgb.Dataset(X_train, label=y_train)
+        return lgb.train(params, train_data, num_boost_round=num_boost_round)
+
+    def predict(model, X):
+        return model.predict(X)
+
+    def get_feature_importance(model, feature_cols):
+        return pd.DataFrame({
+            'feature': feature_cols,
+            'importance': model.feature_importance()
+        }).sort_values('importance', ascending=False)
+
+    return {
+        'name': 'lightgbm',
+        'get_default_params': get_default_params,
+        'get_tuned_params': get_tuned_params,
+        'get_tune_distributions': get_tune_distributions,
+        'get_tuning_model': get_tuning_model,
+        'train': train,
+        'train_final': train_final,
+        'predict': predict,
+        'get_feature_importance': get_feature_importance,
+    }
+
+
+def get_xgboost_backend():
+    import xgboost as xgb
+
+    def get_default_params(config):
+        return {
+            'objective': 'reg:squarederror',
+            'eval_metric': 'rmse',
+            'max_depth': 6,
+            'learning_rate': config['learning_rate'],
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'seed': 42,
+            'n_jobs': -1,
+        }
+
+    def get_tuned_params(tuned):
+        return {
+            'objective': 'reg:squarederror',
+            'eval_metric': 'rmse',
+            'seed': 42,
+            'n_jobs': -1,
+            'max_depth': tuned.get('max_depth', 6),
+            'learning_rate': tuned.get('learning_rate', 0.05),
+            'min_child_weight': tuned.get('min_child_weight', 1),
+            'subsample': tuned.get('subsample', 0.8),
+            'colsample_bytree': tuned.get('colsample_bytree', 0.8),
+            'reg_alpha': tuned.get('reg_alpha', 0),
+            'reg_lambda': tuned.get('reg_lambda', 1),
+        }
+
+    def get_tune_distributions():
+        return {
+            'max_depth': randint(4, 10),
+            'learning_rate': uniform(0.03, 0.12),
+            'n_estimators': randint(200, 500),
+            'min_child_weight': randint(1, 10),
+            'subsample': uniform(0.6, 0.35),
+            'colsample_bytree': uniform(0.6, 0.35),
+            'reg_alpha': uniform(0, 2),
+            'reg_lambda': uniform(0, 2),
+        }
+
+    def get_tuning_model():
+        return xgb.XGBRegressor(
+            objective='reg:squarederror',
+            n_jobs=-1,
+            random_state=42
+        )
+
+    def train(X_tr, y_tr, X_val, y_val, params, num_boost_round):
+        dtrain = xgb.DMatrix(X_tr, label=y_tr)
+        dval = xgb.DMatrix(X_val, label=y_val)
+        model = xgb.train(
+            params,
+            dtrain,
+            num_boost_round=num_boost_round,
+            evals=[(dval, 'val')],
+            early_stopping_rounds=100,
+            verbose_eval=False
+        )
+        return model
+
+    def train_final(X_train, y_train, params, num_boost_round):
+        dtrain = xgb.DMatrix(X_train, label=y_train)
+        return xgb.train(params, dtrain, num_boost_round=num_boost_round)
+
+    def predict(model, X):
+        import xgboost as xgb
+        dtest = xgb.DMatrix(X)
+        return model.predict(dtest)
+
+    def get_feature_importance(model, feature_cols):
+        scores = model.get_score(importance_type='gain')
+        importance = [scores.get(f, 0) for f in feature_cols]
+        return pd.DataFrame({
+            'feature': feature_cols,
+            'importance': importance
+        }).sort_values('importance', ascending=False)
+
+    return {
+        'name': 'xgboost',
+        'get_default_params': get_default_params,
+        'get_tuned_params': get_tuned_params,
+        'get_tune_distributions': get_tune_distributions,
+        'get_tuning_model': get_tuning_model,
+        'train': train,
+        'train_final': train_final,
+        'predict': predict,
+        'get_feature_importance': get_feature_importance,
+    }
+
+
+def get_catboost_backend():
+    from catboost import CatBoostRegressor, Pool
+
+    def get_default_params(config):
+        return {
+            'loss_function': 'RMSE',
+            'depth': 6,
+            'learning_rate': config['learning_rate'],
+            'random_seed': 42,
+            'verbose': False,
+        }
+
+    def get_tuned_params(tuned):
+        return {
+            'loss_function': 'RMSE',
+            'random_seed': 42,
+            'verbose': False,
+            'depth': tuned.get('depth', 6),
+            'learning_rate': tuned.get('learning_rate', 0.05),
+            'l2_leaf_reg': tuned.get('l2_leaf_reg', 3),
+            'bagging_temperature': tuned.get('bagging_temperature', 1),
+        }
+
+    def get_tune_distributions():
+        return {
+            'depth': randint(4, 10),
+            'learning_rate': uniform(0.03, 0.12),
+            'iterations': randint(200, 500),
+            'l2_leaf_reg': uniform(1, 9),
+            'bagging_temperature': uniform(0, 1),
+        }
+
+    def get_tuning_model():
+        return CatBoostRegressor(
+            loss_function='RMSE',
+            random_seed=42,
+            verbose=False
+        )
+
+    def train(X_tr, y_tr, X_val, y_val, params, num_boost_round):
+        model = CatBoostRegressor(**params, iterations=num_boost_round)
+        model.fit(
+            X_tr, y_tr,
+            eval_set=(X_val, y_val),
+            early_stopping_rounds=100,
+            verbose=False
+        )
+        return model
+
+    def train_final(X_train, y_train, params, num_boost_round):
+        model = CatBoostRegressor(**params, iterations=num_boost_round)
+        model.fit(X_train, y_train, verbose=False)
+        return model
+
+    def predict(model, X):
+        return model.predict(X)
+
+    def get_feature_importance(model, feature_cols):
+        return pd.DataFrame({
+            'feature': feature_cols,
+            'importance': model.feature_importances_
+        }).sort_values('importance', ascending=False)
+
+    return {
+        'name': 'catboost',
+        'get_default_params': get_default_params,
+        'get_tuned_params': get_tuned_params,
+        'get_tune_distributions': get_tune_distributions,
+        'get_tuning_model': get_tuning_model,
+        'train': train,
+        'train_final': train_final,
+        'predict': predict,
+        'get_feature_importance': get_feature_importance,
+    }
+
+
+def get_backend(name):
+    backends = {
+        'lightgbm': get_lightgbm_backend,
+        'xgboost': get_xgboost_backend,
+        'catboost': get_catboost_backend,
+    }
+    if name not in backends:
+        raise ValueError(f"Unknown model: {name}. Choose from: {list(backends.keys())}")
+    return backends[name]()
+
+
+# =============================================================================
 # EXPERIMENT CONFIG
 # =============================================================================
 DEFAULT_CONFIG = {
+    # Model selection
+    'model': 'lightgbm',  # 'lightgbm', 'xgboost', 'catboost'
+
     # Feature engineering
     'use_inflation': True,
     'inflation_lag_months': 0,  # 0 = same month, 3 = use price from 3 months prior
@@ -35,7 +318,7 @@ DEFAULT_CONFIG = {
     'tune_iterations': 30,
 
     # Model params (used when not tuning)
-    'num_leaves': 63,
+    'num_leaves': 63,  # LightGBM
     'learning_rate': 0.05,
     'num_boost_round': 2000,
 }
@@ -254,11 +537,12 @@ def prepare_features(train_agg, test_agg):
     return X_train, y.values, X_test, row_ids, feature_cols
 
 
-def tune_hyperparameters(X_train, y_train, bid_dates=None, n_iter=30, n_splits=3, time_based_cv=True):
+def tune_hyperparameters(X_train, y_train, backend, bid_dates=None, n_iter=30, n_splits=3, time_based_cv=True):
     """
-    Tune LightGBM hyperparameters using RandomizedSearchCV.
+    Tune hyperparameters using RandomizedSearchCV.
 
     Args:
+        backend: Model backend dict from get_backend()
         time_based_cv: If True, use TimeSeriesSplit (requires bid_dates).
                        If False, use random KFold.
     """
@@ -269,35 +553,18 @@ def tune_hyperparameters(X_train, y_train, bid_dates=None, n_iter=30, n_splits=3
         X_tune = X_train.iloc[sort_idx].reset_index(drop=True)
         y_tune = y_train[sort_idx]
         cv = TimeSeriesSplit(n_splits=n_splits)
-        print(f"\nTuning on {len(X_tune):,} samples with time-based CV")
+        print(f"\nTuning {backend['name']} on {len(X_tune):,} samples with time-based CV")
         print(f"Date range: {bid_dates.min().date()} to {bid_dates.max().date()}")
     else:
         X_tune = X_train
         y_tune = y_train
         cv = KFold(n_splits=n_splits, shuffle=True, random_state=42)
-        print(f"\nTuning on {len(X_tune):,} samples with random CV")
+        print(f"\nTuning {backend['name']} on {len(X_tune):,} samples with random CV")
 
     print(f"Running {n_iter} iterations × {n_splits} folds = {n_iter * n_splits} fits...")
 
-    param_dist = {
-        'num_leaves': randint(31, 96),
-        'max_depth': randint(4, 10),
-        'learning_rate': uniform(0.03, 0.12),  # 0.03 to 0.15
-        'n_estimators': randint(200, 500),
-        'min_child_samples': randint(10, 50),
-        'subsample': uniform(0.6, 0.35),  # 0.6 to 0.95
-        'colsample_bytree': uniform(0.6, 0.35),  # 0.6 to 0.95
-        'reg_alpha': uniform(0, 2),
-        'reg_lambda': uniform(0, 2),
-    }
-
-    base_model = lgb.LGBMRegressor(
-        objective='regression',
-        boosting_type='gbdt',
-        verbose=-1,
-        n_jobs=-1,
-        random_state=42
-    )
+    param_dist = backend['get_tune_distributions']()
+    base_model = backend['get_tuning_model']()
 
     search = RandomizedSearchCV(
         base_model,
@@ -323,47 +590,18 @@ def tune_hyperparameters(X_train, y_train, bid_dates=None, n_iter=30, n_splits=3
     return search.best_params_
 
 
-def train_and_predict_cv(train_raw, test_raw, config, tuned_params=None):
+def train_and_predict_cv(train_raw, test_raw, config, backend, tuned_params=None):
     """
-    Train LightGBM with proper CV - build price lookup only from training fold.
+    Train model with proper CV - build price lookup only from training fold.
     This avoids data leakage from validation fold contributing to price estimates.
 
     Expects inflation columns to already exist in train_raw and test_raw.
     """
     if tuned_params:
-        params = {
-            'objective': 'regression',
-            'metric': 'rmse',
-            'boosting_type': 'gbdt',
-            'verbose': -1,
-            'seed': 42,
-            'n_jobs': -1,
-            # Map sklearn API params to lgb.train params
-            'num_leaves': tuned_params.get('num_leaves', 63),
-            'max_depth': tuned_params.get('max_depth', -1),
-            'learning_rate': tuned_params.get('learning_rate', 0.05),
-            'min_child_samples': tuned_params.get('min_child_samples', 20),
-            'feature_fraction': tuned_params.get('colsample_bytree', 0.8),
-            'bagging_fraction': tuned_params.get('subsample', 0.8),
-            'bagging_freq': 5,
-            'lambda_l1': tuned_params.get('reg_alpha', 0),
-            'lambda_l2': tuned_params.get('reg_lambda', 0),
-        }
-        num_boost_round = tuned_params.get('n_estimators', 1000)
+        params = backend['get_tuned_params'](tuned_params)
+        num_boost_round = tuned_params.get('n_estimators', tuned_params.get('iterations', 1000))
     else:
-        params = {
-            'objective': 'regression',
-            'metric': 'rmse',
-            'boosting_type': 'gbdt',
-            'num_leaves': config['num_leaves'],
-            'learning_rate': config['learning_rate'],
-            'feature_fraction': 0.8,
-            'bagging_fraction': 0.8,
-            'bagging_freq': 5,
-            'verbose': -1,
-            'seed': 42,
-            'n_jobs': -1
-        }
+        params = backend['get_default_params'](config)
         num_boost_round = config['num_boost_round']
 
     # Get unique job+contractor combinations with their bid dates
@@ -429,19 +667,10 @@ def train_and_predict_cv(train_raw, test_raw, config, tuned_params=None):
         X_tr = X_tr.reindex(columns=feature_cols, fill_value=0)
         X_val = X_val.reindex(columns=feature_cols, fill_value=0)
 
-        train_data = lgb.Dataset(X_tr, label=y_tr)
-        val_data = lgb.Dataset(X_val, label=y_val)
-
-        model = lgb.train(
-            params,
-            train_data,
-            num_boost_round=num_boost_round,
-            valid_sets=[val_data],
-            callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)]
-        )
+        model = backend['train'](X_tr, y_tr, X_val, y_val, params, num_boost_round)
         models.append(model)
 
-        y_pred_val = model.predict(X_val)
+        y_pred_val = backend['predict'](model, X_val)
         rmse = np.sqrt(np.mean((y_val - y_pred_val) ** 2))
         cv_scores.append(rmse)
         print(f"  Fold {fold+1}: RMSE = {rmse:.4f}")
@@ -463,17 +692,13 @@ def train_and_predict_cv(train_raw, test_raw, config, tuned_params=None):
 
     # Feature importance (from last CV model)
     print("\nTop 20 Feature Importance:")
-    importance = pd.DataFrame({
-        'feature': feature_cols,
-        'importance': models[-1].feature_importance()
-    }).sort_values('importance', ascending=False)
+    importance = backend['get_feature_importance'](models[-1], feature_cols)
     print(importance.head(20).to_string(index=False))
 
     # Train final model
-    train_data = lgb.Dataset(X_train, label=y_train)
-    final_model = lgb.train(params, train_data, num_boost_round=num_boost_round)
+    final_model = backend['train_final'](X_train, y_train, params, num_boost_round)
 
-    predictions_log = final_model.predict(X_test)
+    predictions_log = backend['predict'](final_model, X_test)
     predictions = np.expm1(predictions_log)
     predictions = np.maximum(predictions, 0)
 
@@ -490,6 +715,10 @@ def main(config):
         for k, v in config.items():
             print(f"  {k}: {v}")
         print("=" * 60)
+
+        # Get model backend
+        backend = get_backend(config['model'])
+        print(f"\nUsing model: {backend['name']}")
 
         print("\nLoading raw data...")
         train_raw, test_raw = load_and_prepare_data(config)
@@ -511,14 +740,14 @@ def main(config):
             bid_dates = train_agg['bid_date_first']
 
             X_train, y_train, _, _, _ = prepare_features(train_agg, test_agg)
-            tuned_params = tune_hyperparameters(X_train, y_train, bid_dates,
+            tuned_params = tune_hyperparameters(X_train, y_train, backend, bid_dates,
                                                 n_iter=config['tune_iterations'],
                                                 time_based_cv=config['time_based_cv'])
             mlflow.log_params({f"tuned_{k}": v for k, v in tuned_params.items()})
 
         print("\nTraining with CV...")
         predictions, row_ids, cv_scores, feature_importance = train_and_predict_cv(
-            train_raw, test_raw, config, tuned_params=tuned_params
+            train_raw, test_raw, config, backend, tuned_params=tuned_params
         )
 
         # Log metrics
@@ -541,6 +770,7 @@ def main(config):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
+    parser.add_argument('--model', choices=['lightgbm', 'xgboost', 'catboost'], help='Model to use')
     parser.add_argument('--tune', action='store_true', help='Run hyperparameter tuning')
     parser.add_argument('--tune-iterations', type=int, help='Number of tuning iterations')
     parser.add_argument('--random-cv', action='store_true', help='Use random CV instead of time-based CV')
@@ -550,6 +780,8 @@ if __name__ == "__main__":
 
     # Build config from defaults + CLI overrides
     overrides = {}
+    if args.model:
+        overrides['model'] = args.model
     if args.tune:
         overrides['tune'] = True
     if args.tune_iterations:

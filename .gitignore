@@ -136,3 +136,5 @@ models/*.pkl
 models/*.joblib
 
 claude.md
+
+*.db

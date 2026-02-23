@@ -9,30 +9,83 @@ import lightgbm as lgb
 from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit, KFold
 from scipy.stats import randint, uniform
 import warnings
+import mlflow
 
-from utils import extract_date_features, create_submission, add_inflation_features, load_cpi_data
+from utils import extract_date_features, create_submission, add_inflation_features, load_cpi_data, add_dummy_inflation_features
 
 warnings.filterwarnings('ignore')
 
+mlflow.set_experiment("construction-price-prediction")
 
-def load_raw_data():
-    """Load raw line-item data."""
+
+# =============================================================================
+# EXPERIMENT CONFIG
+# =============================================================================
+DEFAULT_CONFIG = {
+    # Feature engineering
+    'use_inflation': True,
+    'inflation_lag_months': 0,  # 0 = same month, 3 = use price from 3 months prior
+
+    # Cross-validation
+    'time_based_cv': True,
+    'cv_splits': 5,
+
+    # Hyperparameter tuning
+    'tune': False,
+    'tune_iterations': 30,
+
+    # Model params (used when not tuning)
+    'num_leaves': 63,
+    'learning_rate': 0.05,
+    'num_boost_round': 2000,
+}
+
+
+def get_config(**overrides):
+    """Get config with optional overrides."""
+    config = DEFAULT_CONFIG.copy()
+    config.update(overrides)
+    return config
+
+
+def load_and_prepare_data(config):
+    """
+    Load raw data and apply inflation adjustment upfront.
+    This centralizes the inflation decision - all downstream code just uses the columns.
+    """
     train = pd.read_csv("./raw_train.csv")
     test = pd.read_csv("./raw_test.csv")
+
+    if config['use_inflation']:
+        cpi_data = load_cpi_data()
+        reference_date = cpi_data.index.max()
+
+        # Apply lag if specified
+        lag = config.get('inflation_lag_months', 0)
+        if lag > 0:
+            reference_date = reference_date - lag
+            print(f"Inflation: {lag}-month lag, reference {reference_date}")
+        else:
+            print(f"Inflation reference date: {reference_date}")
+
+        train = add_inflation_features(train, str(reference_date))
+        test = add_inflation_features(test, str(reference_date))
+    else:
+        print("Inflation adjustment: DISABLED")
+        train = add_dummy_inflation_features(train)
+        test = add_dummy_inflation_features(test)
+
     return train, test
 
 
-def build_unit_price_lookup(train_df, reference_date=None):
+def build_unit_price_lookup(train_df):
     """
     Build lookup table of unit prices from training data.
     Groups by pay_item_description + unit_english_id for granular pricing.
 
-    Prices are inflation-adjusted to reference_date for consistency.
+    Expects inflation_factor column to already exist.
     """
     train_df = train_df.copy()
-
-    # Add inflation adjustment
-    train_df = add_inflation_features(train_df, reference_date)
 
     train_df['unit_price'] = train_df['amount'] / train_df['quantity'].replace(0, np.nan)
 
@@ -58,17 +111,14 @@ def build_unit_price_lookup(train_df, reference_date=None):
     return item_unit_prices, cat_unit_prices, unit_prices
 
 
-def estimate_line_item_cost(df, item_unit_prices, cat_unit_prices, unit_prices, reference_date=None, min_count=5):
+def estimate_line_item_cost(df, item_unit_prices, cat_unit_prices, unit_prices, min_count=5):
     """
     Estimate cost for each line item using learned unit prices.
     Uses hierarchical fallback: item+unit -> category+unit -> unit only
 
-    Lookup prices are at reference_date level; we scale estimates to each bid's date.
+    Expects inflation_factor column to already exist.
     """
     df = df.copy()
-
-    # Add inflation features to get adjustment factor for each row
-    df = add_inflation_features(df, reference_date)
 
     # Merge item+unit prices
     df = df.merge(item_unit_prices, left_on=['pay_item_description', 'unit_english_id'],
@@ -219,14 +269,12 @@ def tune_hyperparameters(X_train, y_train, bid_dates=None, n_iter=30, n_splits=3
         X_tune = X_train.iloc[sort_idx].reset_index(drop=True)
         y_tune = y_train[sort_idx]
         cv = TimeSeriesSplit(n_splits=n_splits)
-        cv_type = "time-based"
         print(f"\nTuning on {len(X_tune):,} samples with time-based CV")
         print(f"Date range: {bid_dates.min().date()} to {bid_dates.max().date()}")
     else:
         X_tune = X_train
         y_tune = y_train
         cv = KFold(n_splits=n_splits, shuffle=True, random_state=42)
-        cv_type = "random"
         print(f"\nTuning on {len(X_tune):,} samples with random CV")
 
     print(f"Running {n_iter} iterations × {n_splits} folds = {n_iter * n_splits} fits...")
@@ -275,21 +323,13 @@ def tune_hyperparameters(X_train, y_train, bid_dates=None, n_iter=30, n_splits=3
     return search.best_params_
 
 
-def train_and_predict_cv(train_raw, test_raw, tuned_params=None, reference_date=None, time_based_cv=True):
+def train_and_predict_cv(train_raw, test_raw, config, tuned_params=None):
     """
     Train LightGBM with proper CV - build price lookup only from training fold.
     This avoids data leakage from validation fold contributing to price estimates.
 
-    Args:
-        reference_date: Date to normalize all prices to (default: latest CPI date)
-        time_based_cv: If True, use TimeSeriesSplit. If False, use random KFold.
+    Expects inflation columns to already exist in train_raw and test_raw.
     """
-    # Use a consistent reference date for inflation adjustment
-    if reference_date is None:
-        cpi_data = load_cpi_data()
-        reference_date = str(cpi_data.index.max())
-        print(f"Using reference date for inflation: {reference_date}")
-
     if tuned_params:
         params = {
             'objective': 'regression',
@@ -315,8 +355,8 @@ def train_and_predict_cv(train_raw, test_raw, tuned_params=None, reference_date=
             'objective': 'regression',
             'metric': 'rmse',
             'boosting_type': 'gbdt',
-            'num_leaves': 63,
-            'learning_rate': 0.05,
+            'num_leaves': config['num_leaves'],
+            'learning_rate': config['learning_rate'],
             'feature_fraction': 0.8,
             'bagging_fraction': 0.8,
             'bagging_freq': 5,
@@ -324,9 +364,10 @@ def train_and_predict_cv(train_raw, test_raw, tuned_params=None, reference_date=
             'seed': 42,
             'n_jobs': -1
         }
-        num_boost_round = 2000
+        num_boost_round = config['num_boost_round']
 
     # Get unique job+contractor combinations with their bid dates
+    train_raw = train_raw.copy()
     train_raw['bid_date_parsed'] = pd.to_datetime(train_raw['bid_date'])
     job_keys = train_raw.groupby(['job_id', 'contractor_id']).agg({
         'bid_date_parsed': 'first'
@@ -334,13 +375,14 @@ def train_and_predict_cv(train_raw, test_raw, tuned_params=None, reference_date=
     job_keys['key'] = job_keys['job_id'] + '__' + job_keys['contractor_id']
 
     # Set up CV strategy
-    if time_based_cv:
+    n_splits = config['cv_splits']
+    if config['time_based_cv']:
         # Sort by date for time-based CV
         job_keys = job_keys.sort_values('bid_date_parsed').reset_index(drop=True)
-        cv = TimeSeriesSplit(n_splits=5)
+        cv = TimeSeriesSplit(n_splits=n_splits)
         print("Time-based CV folds:")
     else:
-        cv = KFold(n_splits=5, shuffle=True, random_state=42)
+        cv = KFold(n_splits=n_splits, shuffle=True, random_state=42)
         print("Random CV folds:")
 
     cv_scores = []
@@ -351,7 +393,7 @@ def train_and_predict_cv(train_raw, test_raw, tuned_params=None, reference_date=
         train_keys_df = job_keys.iloc[train_idx]
         val_keys_df = job_keys.iloc[val_idx]
 
-        if time_based_cv:
+        if config['time_based_cv']:
             train_date_range = f"{train_keys_df['bid_date_parsed'].min().date()} to {train_keys_df['bid_date_parsed'].max().date()}"
             val_date_range = f"{val_keys_df['bid_date_parsed'].min().date()} to {val_keys_df['bid_date_parsed'].max().date()}"
             print(f"  Fold {fold+1}: Train {train_date_range} ({len(train_idx):,} jobs) -> Val {val_date_range} ({len(val_idx):,} jobs)")
@@ -367,11 +409,11 @@ def train_and_predict_cv(train_raw, test_raw, tuned_params=None, reference_date=
         val_fold = train_raw[train_raw['key'].isin(val_keys)].copy()
 
         # Build price lookup ONLY from training fold (no leakage!)
-        item_prices, cat_prices, unit_prices = build_unit_price_lookup(train_fold, reference_date)
+        item_prices, cat_prices, unit_prices = build_unit_price_lookup(train_fold)
 
         # Estimate costs using training-fold prices
-        train_fold = estimate_line_item_cost(train_fold, item_prices, cat_prices, unit_prices, reference_date)
-        val_fold = estimate_line_item_cost(val_fold, item_prices, cat_prices, unit_prices, reference_date)
+        train_fold = estimate_line_item_cost(train_fold, item_prices, cat_prices, unit_prices)
+        val_fold = estimate_line_item_cost(val_fold, item_prices, cat_prices, unit_prices)
 
         # Aggregate to job level
         train_agg = aggregate_job_features(train_fold, is_train=True)
@@ -408,9 +450,9 @@ def train_and_predict_cv(train_raw, test_raw, tuned_params=None, reference_date=
 
     # For final predictions, use all training data
     print("\nTraining final model on all data...")
-    item_prices, cat_prices, unit_prices = build_unit_price_lookup(train_raw, reference_date)
-    train_raw_est = estimate_line_item_cost(train_raw.copy(), item_prices, cat_prices, unit_prices, reference_date)
-    test_raw_est = estimate_line_item_cost(test_raw.copy(), item_prices, cat_prices, unit_prices, reference_date)
+    item_prices, cat_prices, unit_prices = build_unit_price_lookup(train_raw)
+    train_raw_est = estimate_line_item_cost(train_raw.copy(), item_prices, cat_prices, unit_prices)
+    test_raw_est = estimate_line_item_cost(test_raw.copy(), item_prices, cat_prices, unit_prices)
 
     train_agg = aggregate_job_features(train_raw_est, is_train=True)
     test_agg = aggregate_job_features(test_raw_est, is_train=False)
@@ -435,50 +477,89 @@ def train_and_predict_cv(train_raw, test_raw, tuned_params=None, reference_date=
     predictions = np.expm1(predictions_log)
     predictions = np.maximum(predictions, 0)
 
-    return predictions, row_ids
+    return predictions, row_ids, cv_scores, importance
 
 
-def main(tune=False, n_iter=50, time_based_cv=True):
-    print("Loading raw data...")
-    train_raw, test_raw = load_raw_data()
-    print(f"  Train: {train_raw.shape}, Test: {test_raw.shape}")
+def main(config):
+    with mlflow.start_run():
+        # Log config
+        mlflow.log_params(config)
 
-    # Use consistent reference date
-    cpi_data = load_cpi_data()
-    reference_date = str(cpi_data.index.max())
-    print(f"Inflation reference date: {reference_date}")
-    print(f"CV strategy: {'time-based' if time_based_cv else 'random'}")
+        print("=" * 60)
+        print("EXPERIMENT CONFIG:")
+        for k, v in config.items():
+            print(f"  {k}: {v}")
+        print("=" * 60)
 
-    tuned_params = None
-    if tune:
-        # Prepare data for tuning (uses all training data for price lookup)
-        print("\nPreparing data for hyperparameter tuning...")
-        item_prices, cat_prices, unit_prices = build_unit_price_lookup(train_raw, reference_date)
-        train_est = estimate_line_item_cost(train_raw.copy(), item_prices, cat_prices, unit_prices, reference_date)
-        test_est = estimate_line_item_cost(test_raw.copy(), item_prices, cat_prices, unit_prices, reference_date)
+        print("\nLoading raw data...")
+        train_raw, test_raw = load_and_prepare_data(config)
+        print(f"  Train: {train_raw.shape}, Test: {test_raw.shape}")
+        print(f"CV strategy: {'time-based' if config['time_based_cv'] else 'random'}")
 
-        train_agg = aggregate_job_features(train_est, is_train=True)
-        test_agg = aggregate_job_features(test_est, is_train=False)
+        tuned_params = None
+        if config['tune']:
+            # Prepare data for tuning (uses all training data for price lookup)
+            print("\nPreparing data for hyperparameter tuning...")
+            item_prices, cat_prices, unit_prices = build_unit_price_lookup(train_raw)
+            train_est = estimate_line_item_cost(train_raw.copy(), item_prices, cat_prices, unit_prices)
+            test_est = estimate_line_item_cost(test_raw.copy(), item_prices, cat_prices, unit_prices)
 
-        # Keep bid_date before prepare_features drops it
-        bid_dates = train_agg['bid_date_first']
+            train_agg = aggregate_job_features(train_est, is_train=True)
+            test_agg = aggregate_job_features(test_est, is_train=False)
 
-        X_train, y_train, _, _, _ = prepare_features(train_agg, test_agg)
-        tuned_params = tune_hyperparameters(X_train, y_train, bid_dates, n_iter=n_iter, time_based_cv=time_based_cv)
+            # Keep bid_date before prepare_features drops it
+            bid_dates = train_agg['bid_date_first']
 
-    print("\nTraining with CV...")
-    predictions, row_ids = train_and_predict_cv(train_raw, test_raw, tuned_params=tuned_params,
-                                                 reference_date=reference_date, time_based_cv=time_based_cv)
+            X_train, y_train, _, _, _ = prepare_features(train_agg, test_agg)
+            tuned_params = tune_hyperparameters(X_train, y_train, bid_dates,
+                                                n_iter=config['tune_iterations'],
+                                                time_based_cv=config['time_based_cv'])
+            mlflow.log_params({f"tuned_{k}": v for k, v in tuned_params.items()})
 
-    print("\nCreating submission...")
-    create_submission(row_ids, predictions, filename="submission_lgbm_lineitem.csv")
+        print("\nTraining with CV...")
+        predictions, row_ids, cv_scores, feature_importance = train_and_predict_cv(
+            train_raw, test_raw, config, tuned_params=tuned_params
+        )
+
+        # Log metrics
+        mlflow.log_metric("cv_rmse_mean", np.mean(cv_scores))
+        mlflow.log_metric("cv_rmse_std", np.std(cv_scores))
+        for i, score in enumerate(cv_scores):
+            mlflow.log_metric(f"cv_rmse_fold_{i+1}", score)
+
+        # Log feature importance as artifact
+        feature_importance.to_csv("feature_importance.csv", index=False)
+        mlflow.log_artifact("feature_importance.csv")
+
+        print("\nCreating submission...")
+        create_submission(row_ids, predictions, filename="submission.csv")
+        mlflow.log_artifact("submission.csv")
+
+        print(f"\nMLflow run ID: {mlflow.active_run().info.run_id}")
 
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--tune', action='store_true', help='Run hyperparameter tuning')
-    parser.add_argument('--n-iter', type=int, default=30, help='Number of tuning iterations')
+    parser.add_argument('--tune-iterations', type=int, help='Number of tuning iterations')
     parser.add_argument('--random-cv', action='store_true', help='Use random CV instead of time-based CV')
+    parser.add_argument('--no-inflation', action='store_true', help='Disable inflation adjustment')
+    parser.add_argument('--inflation-lag', type=int, help='Months to lag inflation data')
     args = parser.parse_args()
-    main(tune=args.tune, n_iter=args.n_iter, time_based_cv=not args.random_cv)
+
+    # Build config from defaults + CLI overrides
+    overrides = {}
+    if args.tune:
+        overrides['tune'] = True
+    if args.tune_iterations:
+        overrides['tune_iterations'] = args.tune_iterations
+    if args.random_cv:
+        overrides['time_based_cv'] = False
+    if args.no_inflation:
+        overrides['use_inflation'] = False
+    if args.inflation_lag:
+        overrides['inflation_lag_months'] = args.inflation_lag
+
+    config = get_config(**overrides)
+    main(config)

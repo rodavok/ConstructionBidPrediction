@@ -11,11 +11,11 @@ CPI_FILE = Path(__file__).parent.parent / "data" / "cpi_monthly.csv"
 
 
 def load_cpi_data():
-    """Load monthly CPI data."""
+    """Load monthly construction PPI data (WPUSI012011)."""
     cpi = pd.read_csv(CPI_FILE)
-    cpi['date'] = pd.to_datetime(cpi['date'])
+    cpi['date'] = pd.to_datetime(cpi['observation_date'])
     cpi['year_month'] = cpi['date'].dt.to_period('M')
-    return cpi.set_index('year_month')['cpi']
+    return cpi.set_index('year_month')['WPUSI012011']
 
 
 def get_inflation_factor(df, reference_date=None):
@@ -98,6 +98,18 @@ def add_inflation_features(df, reference_date=None):
 
     df['inflation_factor'] = reference_cpi / df['cpi_at_bid']
 
+    return df
+
+
+def add_dummy_inflation_features(df):
+    """
+    Add neutral inflation features (no adjustment).
+
+    Used when inflation adjustment is disabled.
+    """
+    df = df.copy()
+    df['inflation_factor'] = 1.0
+    df['cpi_at_bid'] = 1.0
     return df
 
 

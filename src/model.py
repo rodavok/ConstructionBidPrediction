@@ -287,11 +287,271 @@ def get_catboost_backend():
     }
 
 
+def get_ridge_backend():
+    from sklearn.linear_model import Ridge
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import Pipeline
+
+    def get_default_params(_config):
+        return {
+            'alpha': 1.0,
+        }
+
+    def get_tuned_params(tuned):
+        return {
+            'alpha': tuned.get('ridge__alpha', 1.0),
+        }
+
+    def get_tune_distributions():
+        from scipy.stats import loguniform
+        return {
+            'ridge__alpha': loguniform(1e-3, 1e3),
+        }
+
+    def get_tuning_model():
+        return Pipeline([
+            ('scaler', StandardScaler()),
+            ('ridge', Ridge())
+        ])
+
+    def train(X_tr, y_tr, _X_val, _y_val, params, _num_boost_round):
+        # Validation data and num_boost_round ignored for linear models
+        model = Pipeline([
+            ('scaler', StandardScaler()),
+            ('ridge', Ridge(**params))
+        ])
+        model.fit(X_tr, y_tr)
+        return model
+
+    def train_final(X_train, y_train, params, _num_boost_round):
+        model = Pipeline([
+            ('scaler', StandardScaler()),
+            ('ridge', Ridge(**params))
+        ])
+        model.fit(X_train, y_train)
+        return model
+
+    def predict(model, X):
+        return model.predict(X)
+
+    def get_feature_importance(model, feature_cols):
+        coeffs = model.named_steps['ridge'].coef_
+        return pd.DataFrame({
+            'feature': feature_cols,
+            'importance': np.abs(coeffs)
+        }).sort_values('importance', ascending=False)
+
+    return {
+        'name': 'ridge',
+        'get_default_params': get_default_params,
+        'get_tuned_params': get_tuned_params,
+        'get_tune_distributions': get_tune_distributions,
+        'get_tuning_model': get_tuning_model,
+        'train': train,
+        'train_final': train_final,
+        'predict': predict,
+        'get_feature_importance': get_feature_importance,
+    }
+
+
+def get_elasticnet_backend():
+    from sklearn.linear_model import ElasticNet
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import Pipeline
+
+    def get_default_params(_config):
+        return {
+            'alpha': 1.0,
+            'l1_ratio': 0.5,  # 0 = Ridge, 1 = Lasso
+            'max_iter': 5000,
+        }
+
+    def get_tuned_params(tuned):
+        return {
+            'alpha': tuned.get('elasticnet__alpha', 1.0),
+            'l1_ratio': tuned.get('elasticnet__l1_ratio', 0.5),
+            'max_iter': 5000,
+        }
+
+    def get_tune_distributions():
+        from scipy.stats import loguniform, uniform
+        return {
+            'elasticnet__alpha': loguniform(1e-3, 1e3),
+            'elasticnet__l1_ratio': uniform(0.01, 0.98),  # Avoid pure Ridge/Lasso edge cases
+        }
+
+    def get_tuning_model():
+        return Pipeline([
+            ('scaler', StandardScaler()),
+            ('elasticnet', ElasticNet(max_iter=5000))
+        ])
+
+    def train(X_tr, y_tr, _X_val, _y_val, params, _num_boost_round):
+        model = Pipeline([
+            ('scaler', StandardScaler()),
+            ('elasticnet', ElasticNet(**params))
+        ])
+        model.fit(X_tr, y_tr)
+        return model
+
+    def train_final(X_train, y_train, params, _num_boost_round):
+        model = Pipeline([
+            ('scaler', StandardScaler()),
+            ('elasticnet', ElasticNet(**params))
+        ])
+        model.fit(X_train, y_train)
+        return model
+
+    def predict(model, X):
+        return model.predict(X)
+
+    def get_feature_importance(model, feature_cols):
+        coeffs = model.named_steps['elasticnet'].coef_
+        return pd.DataFrame({
+            'feature': feature_cols,
+            'importance': np.abs(coeffs)
+        }).sort_values('importance', ascending=False)
+
+    return {
+        'name': 'elasticnet',
+        'get_default_params': get_default_params,
+        'get_tuned_params': get_tuned_params,
+        'get_tune_distributions': get_tune_distributions,
+        'get_tuning_model': get_tuning_model,
+        'train': train,
+        'train_final': train_final,
+        'predict': predict,
+        'get_feature_importance': get_feature_importance,
+    }
+
+
+def get_stacking_backend():
+    """
+    Stacking ensemble: LightGBM + XGBoost + CatBoost as base models, Ridge as meta-learner.
+    Uses out-of-fold predictions to train the meta-model (no leakage).
+    """
+    import lightgbm as lgb
+    import xgboost as xgb
+    from catboost import CatBoostRegressor
+    from sklearn.linear_model import Ridge
+    from sklearn.ensemble import StackingRegressor
+
+    def _make_base_estimators():
+        """Create base estimators for stacking."""
+        return [
+            ('lgb', lgb.LGBMRegressor(
+                n_estimators=500,
+                num_leaves=63,
+                learning_rate=0.05,
+                feature_fraction=0.8,
+                bagging_fraction=0.8,
+                bagging_freq=5,
+                verbose=-1,
+                n_jobs=-1,
+                random_state=42
+            )),
+            ('xgb', xgb.XGBRegressor(
+                n_estimators=500,
+                max_depth=6,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                n_jobs=-1,
+                random_state=42
+            )),
+            ('catboost', CatBoostRegressor(
+                iterations=500,
+                depth=6,
+                learning_rate=0.05,
+                verbose=False,
+                random_seed=42
+            )),
+        ]
+
+    def _make_stacking_model(final_alpha=1.0):
+        """Create the stacking regressor."""
+        return StackingRegressor(
+            estimators=_make_base_estimators(),
+            final_estimator=Ridge(alpha=final_alpha),
+            cv=5,  # 5-fold CV for generating meta-features
+            n_jobs=-1,
+            passthrough=False,  # Only use base model predictions as meta-features
+        )
+
+    def get_default_params(_config):
+        return {
+            'final_alpha': 1.0,
+        }
+
+    def get_tuned_params(tuned):
+        return {
+            'final_alpha': tuned.get('final_estimator__alpha', 1.0),
+        }
+
+    def get_tune_distributions():
+        from scipy.stats import loguniform
+        return {
+            'final_estimator__alpha': loguniform(1e-3, 1e3),
+        }
+
+    def get_tuning_model():
+        return _make_stacking_model()
+
+    def train(X_tr, y_tr, _X_val, _y_val, params, _num_boost_round):
+        # StackingRegressor handles internal CV for meta-features
+        model = _make_stacking_model(final_alpha=params.get('final_alpha', 1.0))
+        model.fit(X_tr, y_tr)
+        return model
+
+    def train_final(X_train, y_train, params, _num_boost_round):
+        model = _make_stacking_model(final_alpha=params.get('final_alpha', 1.0))
+        model.fit(X_train, y_train)
+        return model
+
+    def predict(model, X):
+        return model.predict(X)
+
+    def get_feature_importance(model, feature_cols):
+        # Get feature importance from each base estimator
+        lgb_importance = model.named_estimators_['lgb'].feature_importances_
+        xgb_importance = model.named_estimators_['xgb'].feature_importances_
+        cat_importance = model.named_estimators_['catboost'].feature_importances_
+
+        # Normalize each to 0-1 scale and average
+        lgb_norm = lgb_importance / (lgb_importance.max() + 1e-10)
+        xgb_norm = xgb_importance / (xgb_importance.max() + 1e-10)
+        cat_norm = cat_importance / (cat_importance.max() + 1e-10)
+        combined = (lgb_norm + xgb_norm + cat_norm) / 3
+
+        return pd.DataFrame({
+            'feature': feature_cols,
+            'importance': combined,
+            'importance_lgb': lgb_importance,
+            'importance_xgb': xgb_importance,
+            'importance_catboost': cat_importance,
+        }).sort_values('importance', ascending=False)
+
+    return {
+        'name': 'stacking',
+        'get_default_params': get_default_params,
+        'get_tuned_params': get_tuned_params,
+        'get_tune_distributions': get_tune_distributions,
+        'get_tuning_model': get_tuning_model,
+        'train': train,
+        'train_final': train_final,
+        'predict': predict,
+        'get_feature_importance': get_feature_importance,
+    }
+
+
 def get_backend(name):
     backends = {
         'lightgbm': get_lightgbm_backend,
         'xgboost': get_xgboost_backend,
         'catboost': get_catboost_backend,
+        'ridge': get_ridge_backend,
+        'elasticnet': get_elasticnet_backend,
+        'stacking': get_stacking_backend,
     }
     if name not in backends:
         raise ValueError(f"Unknown model: {name}. Choose from: {list(backends.keys())}")
@@ -373,9 +633,13 @@ def load_and_prepare_data(config):
         print("Adding contractor win history feature...")
         train, test = compute_contractor_win_history(train, test)
     else:
-        # Add dummy column so downstream code doesn't break
+        # Add dummy columns so downstream code doesn't break
         train['contractor_prior_wins'] = 0
+        train['contractor_prior_wins_category'] = 0
+        train['contractor_prior_wins_location'] = 0
         test['contractor_prior_wins'] = 0
+        test['contractor_prior_wins_category'] = 0
+        test['contractor_prior_wins_location'] = 0
 
     if config.get('use_competition_intensity', False):
         print("Adding competition intensity feature...")
@@ -392,53 +656,78 @@ def compute_contractor_win_history(train_df, test_df=None):
     Compute how many jobs each contractor has won at the time of each bid.
     Winner = contractor with lowest total_bid for each job.
 
+    Computes three features (all using only wins strictly before bid_date):
+    - contractor_prior_wins: total wins across all jobs
+    - contractor_prior_wins_category: wins in the same job_category_description
+    - contractor_prior_wins_location: wins in the same primary_location
+
     For training: uses only wins strictly before each bid's date (no leakage).
     For test: uses all training wins before each test bid's date.
     """
-    # Get unique bids (job_id + contractor_id level)
+    # Get unique bids (job_id + contractor_id level) with category and location
     train_bids = train_df.groupby(['job_id', 'contractor_id']).agg({
         'bid_date': 'first',
-        'total_bid': 'first'
+        'total_bid': 'first',
+        'job_category_description': 'first',
+        'primary_location': 'first'
     }).reset_index()
     train_bids['bid_date'] = pd.to_datetime(train_bids['bid_date'])
 
-    # Identify winner for each job (lowest bid)
+    # Identify winner for each job (lowest bid) - include category and location
     winners = train_bids.loc[train_bids.groupby('job_id')['total_bid'].idxmin()]
-    winners = winners[['job_id', 'contractor_id', 'bid_date']].copy()
-    winners.columns = ['job_id', 'winner_contractor', 'win_date']
+    winners = winners[['job_id', 'contractor_id', 'bid_date', 'job_category_description', 'primary_location']].copy()
+    winners.columns = ['job_id', 'winner_contractor', 'win_date', 'win_category', 'win_location']
 
-    # For each bid, count contractor's wins strictly before bid_date
     def count_prior_wins(row, win_history):
+        """Count contractor's wins strictly before bid_date."""
         contractor = row['contractor_id']
         bid_date = row['bid_date']
-        contractor_wins = win_history[win_history['winner_contractor'] == contractor]
-        prior_wins = (contractor_wins['win_date'] < bid_date).sum()
-        return prior_wins
+        contractor_wins = win_history[
+            (win_history['winner_contractor'] == contractor) &
+            (win_history['win_date'] < bid_date)
+        ]
+
+        # Total wins
+        total_wins = len(contractor_wins)
+
+        # Wins in same category
+        category_wins = (contractor_wins['win_category'] == row['job_category_description']).sum()
+
+        # Wins in same location
+        location_wins = (contractor_wins['win_location'] == row['primary_location']).sum()
+
+        return total_wins, category_wins, location_wins
 
     # Compute for training data
-    train_bids['contractor_prior_wins'] = train_bids.apply(
-        lambda r: count_prior_wins(r, winners), axis=1
-    )
+    win_counts = train_bids.apply(lambda r: count_prior_wins(r, winners), axis=1)
+    train_bids['contractor_prior_wins'] = win_counts.apply(lambda x: x[0])
+    train_bids['contractor_prior_wins_category'] = win_counts.apply(lambda x: x[1])
+    train_bids['contractor_prior_wins_location'] = win_counts.apply(lambda x: x[2])
 
     # Merge back to line-item level
-    win_counts = train_bids[['job_id', 'contractor_id', 'contractor_prior_wins']]
-    train_df = train_df.merge(win_counts, on=['job_id', 'contractor_id'], how='left')
-    train_df['contractor_prior_wins'] = train_df['contractor_prior_wins'].fillna(0).astype(int)
+    win_cols = ['job_id', 'contractor_id', 'contractor_prior_wins',
+                'contractor_prior_wins_category', 'contractor_prior_wins_location']
+    train_df = train_df.merge(train_bids[win_cols], on=['job_id', 'contractor_id'], how='left')
+    for col in ['contractor_prior_wins', 'contractor_prior_wins_category', 'contractor_prior_wins_location']:
+        train_df[col] = train_df[col].fillna(0).astype(int)
 
     if test_df is not None:
-        # For test, use all training wins
+        # For test, use all training wins before each test bid's date
         test_bids = test_df.groupby(['job_id', 'contractor_id']).agg({
-            'bid_date': 'first'
+            'bid_date': 'first',
+            'job_category_description': 'first',
+            'primary_location': 'first'
         }).reset_index()
         test_bids['bid_date'] = pd.to_datetime(test_bids['bid_date'])
 
-        test_bids['contractor_prior_wins'] = test_bids.apply(
-            lambda r: count_prior_wins(r, winners), axis=1
-        )
+        win_counts = test_bids.apply(lambda r: count_prior_wins(r, winners), axis=1)
+        test_bids['contractor_prior_wins'] = win_counts.apply(lambda x: x[0])
+        test_bids['contractor_prior_wins_category'] = win_counts.apply(lambda x: x[1])
+        test_bids['contractor_prior_wins_location'] = win_counts.apply(lambda x: x[2])
 
-        test_win_counts = test_bids[['job_id', 'contractor_id', 'contractor_prior_wins']]
-        test_df = test_df.merge(test_win_counts, on=['job_id', 'contractor_id'], how='left')
-        test_df['contractor_prior_wins'] = test_df['contractor_prior_wins'].fillna(0).astype(int)
+        test_df = test_df.merge(test_bids[win_cols], on=['job_id', 'contractor_id'], how='left')
+        for col in ['contractor_prior_wins', 'contractor_prior_wins_category', 'contractor_prior_wins_location']:
+            test_df[col] = test_df[col].fillna(0).astype(int)
 
         return train_df, test_df
 
@@ -580,6 +869,8 @@ def aggregate_job_features(df, is_train=True):
 
         # Contractor history
         'contractor_prior_wins': 'first',
+        'contractor_prior_wins_category': 'first',
+        'contractor_prior_wins_location': 'first',
 
         # Competition intensity
         'num_bidders': 'first',
@@ -1029,16 +1320,25 @@ def main(config):
         mlflow.log_artifact("feature_importance.csv")
 
         print("\nCreating submission...")
-        create_submission(row_ids, predictions, filename="submission.csv")
-        mlflow.log_artifact("submission.csv")
+        run_id = mlflow.active_run().info.run_id
+        run_id_short = run_id[:8]  # First 8 chars for readability
 
-        print(f"\nMLflow run ID: {mlflow.active_run().info.run_id}")
+        # Save to submissions directory with run ID
+        import os
+        os.makedirs("submissions", exist_ok=True)
+        submission_path = f"submissions/submission_{run_id_short}.csv"
+
+        create_submission(row_ids, predictions, filename=submission_path)
+        mlflow.log_artifact(submission_path)
+
+        print(f"\nMLflow run ID: {run_id}")
+        print(f"To view run: mlflow runs get -r {run_id}")
 
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', choices=['lightgbm', 'xgboost', 'catboost'], help='Model to use')
+    parser.add_argument('--model', choices=['lightgbm', 'xgboost', 'catboost', 'ridge', 'elasticnet', 'stacking'], help='Model to use')
     parser.add_argument('--aggregated', action='store_true', help='Use aggregated dataset (train_summary.csv) instead of line-items')
     parser.add_argument('--tune', action='store_true', help='Run hyperparameter tuning')
     parser.add_argument('--tune-iterations', type=int, help='Number of tuning iterations')

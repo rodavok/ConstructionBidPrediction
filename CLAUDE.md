@@ -15,7 +15,7 @@ Say: "Ready to run. Execute with: `python src/model.py --tune`"
 
 | Argument | Type | Description |
 |----------|------|-------------|
-| `--model` | choice | Model backend: `lightgbm`, `xgboost`, `catboost` |
+| `--model` | choice | Model backend: `lightgbm`, `xgboost`, `catboost`, `ridge`, `elasticnet`, `stacking` |
 | `--tune` | flag | Enable hyperparameter tuning via RandomizedSearchCV |
 | `--tune-iterations` | int | Number of tuning iterations (default: 30) |
 | `--random-cv` | flag | Use random KFold CV instead of time-based CV |

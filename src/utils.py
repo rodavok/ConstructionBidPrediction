@@ -8,14 +8,52 @@ from pathlib import Path
 
 DATA_DIR = "."
 CPI_FILE = Path(__file__).parent.parent / "data" / "cpi_monthly.csv"
+ECI_FILE = Path(__file__).parent.parent / "data" / "eci-seasonal-dataset.xlsx"
+
+
+def load_materials_ppi():
+    """Load monthly construction materials PPI data (WPUSI012011)."""
+    ppi = pd.read_csv(CPI_FILE)
+    ppi['date'] = pd.to_datetime(ppi['observation_date'])
+    ppi['year_month'] = ppi['date'].dt.to_period('M')
+    return ppi.set_index('year_month')['WPUSI012011']
+
+
+def load_labor_eci():
+    """
+    Load construction labor ECI data and interpolate to monthly.
+
+    Source: BLS Employment Cost Index, Construction industry,
+    Wages and salaries, seasonally adjusted.
+    """
+    df = pd.read_excel(ECI_FILE, sheet_name='Seasonal dataset')
+
+    # Filter for construction wages index
+    labor = df[
+        (df['Industry'] == 'Construction') &
+        (df['Estimate Type'] == 'Wages and salaries') &
+        (df['Periodicity'] == 'Current dollar index number')
+    ][['Year', 'Period', 'Estimate']].copy()
+
+    # Convert quarter-end months to dates
+    month_map = {'March': 3, 'June': 6, 'September': 9, 'December': 12}
+    labor['month'] = labor['Period'].map(month_map)
+    labor['date'] = pd.to_datetime(
+        labor['Year'].astype(str) + '-' + labor['month'].astype(str) + '-01'
+    )
+    labor = labor.sort_values('date').set_index('date')['Estimate']
+
+    # Interpolate to monthly frequency
+    monthly_index = pd.date_range(labor.index.min(), labor.index.max(), freq='MS')
+    labor_monthly = labor.reindex(monthly_index).interpolate(method='linear')
+    labor_monthly.index = labor_monthly.index.to_period('M')
+
+    return labor_monthly
 
 
 def load_cpi_data():
-    """Load monthly construction PPI data (WPUSI012011)."""
-    cpi = pd.read_csv(CPI_FILE)
-    cpi['date'] = pd.to_datetime(cpi['observation_date'])
-    cpi['year_month'] = cpi['date'].dt.to_period('M')
-    return cpi.set_index('year_month')['WPUSI012011']
+    """Load monthly construction PPI data (WPUSI012011). Deprecated alias."""
+    return load_materials_ppi()
 
 
 def get_inflation_factor(df, reference_date=None):
@@ -68,35 +106,51 @@ def add_inflation_features(df, reference_date=None):
 
     Args:
         df: DataFrame with 'bid_date' column
-        reference_date: Target date for adjustment
+        reference_date: Target date for adjustment (period string like '2025-12')
 
     Returns:
         DataFrame with added columns:
-        - inflation_factor: multiplier to adjust prices to reference date
-        - cpi_at_bid: CPI value at time of bid
+        - inflation_factor: materials PPI adjustment factor
+        - materials_ppi: PPI value at time of bid
+        - labor_eci: labor ECI value at time of bid
+        - labor_inflation_factor: labor ECI adjustment factor
     """
-    cpi_data = load_cpi_data()
+    materials = load_materials_ppi()
+    labor = load_labor_eci()
 
     if reference_date is None:
-        reference_date = cpi_data.index.max()
+        # Use the latest date available in both indices
+        ref_materials = materials.index.max()
+        ref_labor = labor.index.max()
     else:
-        reference_date = pd.Period(reference_date, freq='M')
+        ref_materials = pd.Period(reference_date, freq='M')
+        ref_labor = pd.Period(reference_date, freq='M')
 
-    reference_cpi = cpi_data[reference_date]
+    # Clamp to available data range
+    ref_materials = min(ref_materials, materials.index.max())
+    ref_labor = min(ref_labor, labor.index.max())
+
+    ref_materials_val = materials[ref_materials]
+    ref_labor_val = labor[ref_labor]
 
     df = df.copy()
     df['bid_date'] = pd.to_datetime(df['bid_date'])
     bid_periods = df['bid_date'].dt.to_period('M')
 
-    # Map to CPI values
-    df['cpi_at_bid'] = bid_periods.map(cpi_data)
+    # Materials PPI
+    df['materials_ppi'] = bid_periods.map(materials)
+    if df['materials_ppi'].isna().any():
+        df['materials_ppi'] = df['materials_ppi'].fillna(materials.iloc[-1])
+    df['inflation_factor'] = ref_materials_val / df['materials_ppi']
 
-    # Fill missing with latest known CPI
-    if df['cpi_at_bid'].isna().any():
-        latest_cpi = cpi_data.iloc[-1]
-        df['cpi_at_bid'] = df['cpi_at_bid'].fillna(latest_cpi)
+    # Labor ECI
+    df['labor_eci'] = bid_periods.map(labor)
+    if df['labor_eci'].isna().any():
+        df['labor_eci'] = df['labor_eci'].fillna(labor.iloc[-1])
+    df['labor_inflation_factor'] = ref_labor_val / df['labor_eci']
 
-    df['inflation_factor'] = reference_cpi / df['cpi_at_bid']
+    # Keep cpi_at_bid as alias for backwards compatibility
+    df['cpi_at_bid'] = df['materials_ppi']
 
     return df
 
@@ -110,6 +164,9 @@ def add_dummy_inflation_features(df):
     df = df.copy()
     df['inflation_factor'] = 1.0
     df['cpi_at_bid'] = 1.0
+    df['materials_ppi'] = 1.0
+    df['labor_eci'] = 1.0
+    df['labor_inflation_factor'] = 1.0
     return df
 
 

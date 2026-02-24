@@ -308,6 +308,7 @@ DEFAULT_CONFIG = {
     # Feature engineering
     'use_inflation': True,
     'inflation_lag_months': 0,  # 0 = same month, 3 = use price from 3 months prior
+    'use_contractor_history': False,  # Add contractor win count at bid time
 
     # Cross-validation
     'time_based_cv': True,
@@ -358,7 +359,73 @@ def load_and_prepare_data(config):
         train = add_dummy_inflation_features(train)
         test = add_dummy_inflation_features(test)
 
+    if config.get('use_contractor_history', False):
+        print("Adding contractor win history feature...")
+        train, test = compute_contractor_win_history(train, test)
+    else:
+        # Add dummy column so downstream code doesn't break
+        train['contractor_prior_wins'] = 0
+        test['contractor_prior_wins'] = 0
+
     return train, test
+
+
+def compute_contractor_win_history(train_df, test_df=None):
+    """
+    Compute how many jobs each contractor has won at the time of each bid.
+    Winner = contractor with lowest total_bid for each job.
+
+    For training: uses only wins strictly before each bid's date (no leakage).
+    For test: uses all training wins before each test bid's date.
+    """
+    # Get unique bids (job_id + contractor_id level)
+    train_bids = train_df.groupby(['job_id', 'contractor_id']).agg({
+        'bid_date': 'first',
+        'total_bid': 'first'
+    }).reset_index()
+    train_bids['bid_date'] = pd.to_datetime(train_bids['bid_date'])
+
+    # Identify winner for each job (lowest bid)
+    winners = train_bids.loc[train_bids.groupby('job_id')['total_bid'].idxmin()]
+    winners = winners[['job_id', 'contractor_id', 'bid_date']].copy()
+    winners.columns = ['job_id', 'winner_contractor', 'win_date']
+
+    # For each bid, count contractor's wins strictly before bid_date
+    def count_prior_wins(row, win_history):
+        contractor = row['contractor_id']
+        bid_date = row['bid_date']
+        contractor_wins = win_history[win_history['winner_contractor'] == contractor]
+        prior_wins = (contractor_wins['win_date'] < bid_date).sum()
+        return prior_wins
+
+    # Compute for training data
+    train_bids['contractor_prior_wins'] = train_bids.apply(
+        lambda r: count_prior_wins(r, winners), axis=1
+    )
+
+    # Merge back to line-item level
+    win_counts = train_bids[['job_id', 'contractor_id', 'contractor_prior_wins']]
+    train_df = train_df.merge(win_counts, on=['job_id', 'contractor_id'], how='left')
+    train_df['contractor_prior_wins'] = train_df['contractor_prior_wins'].fillna(0).astype(int)
+
+    if test_df is not None:
+        # For test, use all training wins
+        test_bids = test_df.groupby(['job_id', 'contractor_id']).agg({
+            'bid_date': 'first'
+        }).reset_index()
+        test_bids['bid_date'] = pd.to_datetime(test_bids['bid_date'])
+
+        test_bids['contractor_prior_wins'] = test_bids.apply(
+            lambda r: count_prior_wins(r, winners), axis=1
+        )
+
+        test_win_counts = test_bids[['job_id', 'contractor_id', 'contractor_prior_wins']]
+        test_df = test_df.merge(test_win_counts, on=['job_id', 'contractor_id'], how='left')
+        test_df['contractor_prior_wins'] = test_df['contractor_prior_wins'].fillna(0).astype(int)
+
+        return train_df, test_df
+
+    return train_df
 
 
 def build_unit_price_lookup(train_df):
@@ -457,9 +524,14 @@ def aggregate_job_features(df, is_train=True):
         # Inflation-adjusted cost (at reference date prices)
         'estimated_cost_ref': ['sum', 'mean'],
 
-        # Inflation features
-        'inflation_factor': 'first',  # Same for all items in a bid
-        'cpi_at_bid': 'first',
+        # Inflation features (materials PPI + labor ECI)
+        'inflation_factor': 'first',  # Materials PPI adjustment factor
+        'cpi_at_bid': 'first',  # Materials PPI value
+        'labor_eci': 'first',  # Labor cost index
+        'labor_inflation_factor': 'first',  # Labor adjustment factor
+
+        # Contractor history
+        'contractor_prior_wins': 'first',
     }
 
     if is_train:
@@ -776,6 +848,7 @@ if __name__ == "__main__":
     parser.add_argument('--random-cv', action='store_true', help='Use random CV instead of time-based CV')
     parser.add_argument('--no-inflation', action='store_true', help='Disable inflation adjustment')
     parser.add_argument('--inflation-lag', type=int, help='Months to lag inflation data')
+    parser.add_argument('--contractor-history', action='store_true', help='Add contractor prior wins feature')
     args = parser.parse_args()
 
     # Build config from defaults + CLI overrides
@@ -792,6 +865,8 @@ if __name__ == "__main__":
         overrides['use_inflation'] = False
     if args.inflation_lag:
         overrides['inflation_lag_months'] = args.inflation_lag
+    if args.contractor_history:
+        overrides['use_contractor_history'] = True
 
     config = get_config(**overrides)
     main(config)

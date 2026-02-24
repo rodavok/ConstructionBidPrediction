@@ -46,3 +46,58 @@ All runs are tracked under the `construction-price-prediction` experiment.
 **Logged artifacts:**
 - `feature_importance.csv`
 - `submission.csv`
+
+---
+
+## Project Status: Diminishing Returns Analysis
+
+### Model Selection - SATURATED
+| Model | Status | Notes |
+|-------|--------|-------|
+| LightGBM | Tuned | Primary model, well-optimized |
+| XGBoost | Tuned | Similar performance to LightGBM |
+| CatBoost | Tuned | Similar performance |
+| Ridge/ElasticNet | Tested | Linear baselines, significantly worse |
+| Stacking | Implemented | Ensemble of above; marginal gains over single best |
+
+**Verdict:** Switching models unlikely to yield significant improvement. All major gradient boosting frameworks explored.
+
+### Hyperparameter Tuning - SATURATED
+- RandomizedSearchCV with 30+ iterations per model
+- Ranges are well-calibrated (learning rate 0.03-0.15, depth 4-10, regularization 0-2)
+- Early stopping prevents overfitting
+- Time-based CV ensures proper temporal validation
+
+**Verdict:** Further tuning iterations yield diminishing returns. Current params are near-optimal.
+
+### Feature Engineering - MODERATE POTENTIAL REMAINING
+
+#### Implemented (tested)
+| Feature | Impact |
+|---------|--------|
+| Inflation adjustment (materials PPI + labor ECI) | Moderate |
+| Line-item unit price estimation | High - core predictive signal |
+| Date features (month, year, day of week) | Low-moderate |
+| Category/location encodings | Moderate |
+| Contractor prior wins (total, by category, by location) | Low |
+| Competition intensity (# bidders) | Low |
+
+#### Potential ideas not yet explored
+- **Geographic cost indices** - regional labor/material cost multipliers
+- **Seasonality interactions** - category × month interactions
+- **Item co-occurrence** - which pay items appear together
+- **Bid spread features** - how does this contractor's estimate compare to their typical markup
+- **Project complexity** - ratio of unique items to total items, variance in quantities
+- **Historical accuracy** - contractor's past bid-to-actual ratios (if outcome data available)
+
+**Verdict:** Most obvious features implemented. Remaining ideas require additional data sources or more complex feature engineering with uncertain payoff.
+
+### Data Quality / Leakage - CHECK COMPLETE
+- Price lookup uses only training fold data (no leakage)
+- Time-based CV respects temporal ordering
+- Contractor history computed only from prior wins
+
+### Recommended Next Steps (if pursuing further)
+1. **Error analysis** - examine worst predictions to identify systematic patterns
+2. **External data** - regional cost indices, commodity prices, weather
+3. **Target engineering** - predict log-ratio to estimated cost instead of raw bid

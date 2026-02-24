@@ -4,6 +4,8 @@ Uses quantity data and learned unit prices to estimate job costs
 Supports LightGBM, XGBoost, and CatBoost
 """
 
+import json
+import os
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit, KFold
@@ -16,6 +18,32 @@ from utils import extract_date_features, create_submission, add_inflation_featur
 warnings.filterwarnings('ignore')
 
 mlflow.set_experiment("construction-price-prediction")
+
+TUNED_PARAMS_FILE = "tuned_params.json"
+
+
+def load_tuned_params():
+    """Load previously tuned parameters from disk."""
+    if os.path.exists(TUNED_PARAMS_FILE):
+        with open(TUNED_PARAMS_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+
+def save_tuned_params(model_name, params):
+    """Save tuned parameters for a model to disk."""
+    all_params = load_tuned_params()
+    # Convert numpy types to Python types for JSON serialization
+    clean_params = {}
+    for k, v in params.items():
+        if hasattr(v, 'item'):  # numpy scalar
+            clean_params[k] = v.item()
+        else:
+            clean_params[k] = v
+    all_params[model_name] = clean_params
+    with open(TUNED_PARAMS_FILE, 'w') as f:
+        json.dump(all_params, f, indent=2)
+    print(f"Saved tuned params for '{model_name}' to {TUNED_PARAMS_FILE}")
 
 
 # =============================================================================
@@ -429,6 +457,13 @@ def get_stacking_backend():
     """
     Stacking ensemble: LightGBM + XGBoost + CatBoost as base models, Ridge as meta-learner.
     Uses out-of-fold predictions to train the meta-model (no leakage).
+
+    Base model hyperparameters are loaded from tuned_params.json if available.
+    Run each model with --tune first to populate the file:
+        python src/model.py --model lightgbm --tune
+        python src/model.py --model xgboost --tune
+        python src/model.py --model catboost --tune
+        python src/model.py --model stacking  # uses tuned params
     """
     import lightgbm as lgb
     import xgboost as xgb
@@ -437,35 +472,71 @@ def get_stacking_backend():
     from sklearn.ensemble import StackingRegressor
 
     def _make_base_estimators():
-        """Create base estimators for stacking."""
+        """Create base estimators for stacking, using tuned params if available."""
+        saved = load_tuned_params()
+
+        # LightGBM params
+        lgb_saved = saved.get('lightgbm', {})
+        lgb_params = {
+            'n_estimators': lgb_saved.get('n_estimators', 500),
+            'num_leaves': lgb_saved.get('num_leaves', 63),
+            'max_depth': lgb_saved.get('max_depth', -1),
+            'learning_rate': lgb_saved.get('learning_rate', 0.05),
+            'min_child_samples': lgb_saved.get('min_child_samples', 20),
+            'subsample': lgb_saved.get('subsample', 0.8),
+            'colsample_bytree': lgb_saved.get('colsample_bytree', 0.8),
+            'reg_alpha': lgb_saved.get('reg_alpha', 0),
+            'reg_lambda': lgb_saved.get('reg_lambda', 0),
+            'verbose': -1,
+            'n_jobs': -1,
+            'random_state': 42,
+        }
+
+        # XGBoost params
+        xgb_saved = saved.get('xgboost', {})
+        xgb_params = {
+            'n_estimators': xgb_saved.get('n_estimators', 500),
+            'max_depth': xgb_saved.get('max_depth', 6),
+            'learning_rate': xgb_saved.get('learning_rate', 0.05),
+            'min_child_weight': xgb_saved.get('min_child_weight', 1),
+            'subsample': xgb_saved.get('subsample', 0.8),
+            'colsample_bytree': xgb_saved.get('colsample_bytree', 0.8),
+            'reg_alpha': xgb_saved.get('reg_alpha', 0),
+            'reg_lambda': xgb_saved.get('reg_lambda', 1),
+            'n_jobs': -1,
+            'random_state': 42,
+        }
+
+        # CatBoost params
+        cat_saved = saved.get('catboost', {})
+        cat_params = {
+            'iterations': cat_saved.get('iterations', 500),
+            'depth': cat_saved.get('depth', 6),
+            'learning_rate': cat_saved.get('learning_rate', 0.05),
+            'l2_leaf_reg': cat_saved.get('l2_leaf_reg', 3),
+            'bagging_temperature': cat_saved.get('bagging_temperature', 1),
+            'verbose': False,
+            'random_seed': 42,
+        }
+
+        # Log which params are from tuning
+        if lgb_saved:
+            print(f"  LightGBM: using tuned params")
+        else:
+            print(f"  LightGBM: using defaults (run --model lightgbm --tune to tune)")
+        if xgb_saved:
+            print(f"  XGBoost: using tuned params")
+        else:
+            print(f"  XGBoost: using defaults (run --model xgboost --tune to tune)")
+        if cat_saved:
+            print(f"  CatBoost: using tuned params")
+        else:
+            print(f"  CatBoost: using defaults (run --model catboost --tune to tune)")
+
         return [
-            ('lgb', lgb.LGBMRegressor(
-                n_estimators=500,
-                num_leaves=63,
-                learning_rate=0.05,
-                feature_fraction=0.8,
-                bagging_fraction=0.8,
-                bagging_freq=5,
-                verbose=-1,
-                n_jobs=-1,
-                random_state=42
-            )),
-            ('xgb', xgb.XGBRegressor(
-                n_estimators=500,
-                max_depth=6,
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                n_jobs=-1,
-                random_state=42
-            )),
-            ('catboost', CatBoostRegressor(
-                iterations=500,
-                depth=6,
-                learning_rate=0.05,
-                verbose=False,
-                random_seed=42
-            )),
+            ('lgb', lgb.LGBMRegressor(**lgb_params)),
+            ('xgb', xgb.XGBRegressor(**xgb_params)),
+            ('catboost', CatBoostRegressor(**cat_params)),
         ]
 
     def _make_stacking_model(final_alpha=1.0):
@@ -1298,6 +1369,9 @@ def main(config):
                                                 n_iter=config['tune_iterations'],
                                                 time_based_cv=config['time_based_cv'])
             mlflow.log_params({f"tuned_{k}": v for k, v in tuned_params.items()})
+
+            # Save tuned params for reuse (e.g., in stacking)
+            save_tuned_params(config['model'], tuned_params)
 
         print("\nTraining with CV...")
         if use_aggregated:

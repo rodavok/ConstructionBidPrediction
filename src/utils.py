@@ -183,8 +183,6 @@ def extract_date_features(df):
     df['bid_date'] = pd.to_datetime(df['bid_date'])
     df['year'] = df['bid_date'].dt.year
     df['month'] = df['bid_date'].dt.month
-    df['day_of_year'] = df['bid_date'].dt.dayofyear
-    df['day_of_week'] = df['bid_date'].dt.dayofweek
     return df
 
 

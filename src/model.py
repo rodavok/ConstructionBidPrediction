@@ -305,10 +305,14 @@ DEFAULT_CONFIG = {
     # Model selection
     'model': 'lightgbm',  # 'lightgbm', 'xgboost', 'catboost'
 
+    # Data source
+    'use_aggregated': False,  # True = train_summary.csv/test.csv, False = raw_train.csv/raw_test.csv
+
     # Feature engineering
     'use_inflation': True,
     'inflation_lag_months': 0,  # 0 = same month, 3 = use price from 3 months prior
     'use_contractor_history': False,  # Add contractor win count at bid time
+    'use_competition_intensity': False,  # Add number of bidders per job
 
     # Cross-validation
     'time_based_cv': True,
@@ -334,11 +338,17 @@ def get_config(**overrides):
 
 def load_and_prepare_data(config):
     """
-    Load raw data and apply inflation adjustment upfront.
+    Load data and apply inflation adjustment upfront.
     This centralizes the inflation decision - all downstream code just uses the columns.
     """
-    train = pd.read_csv("./raw_train.csv")
-    test = pd.read_csv("./raw_test.csv")
+    if config.get('use_aggregated', False):
+        train = pd.read_csv("./train_summary.csv")
+        test = pd.read_csv("./test.csv")
+        print("Using AGGREGATED dataset (train_summary.csv, test.csv)")
+    else:
+        train = pd.read_csv("./raw_train.csv")
+        test = pd.read_csv("./raw_test.csv")
+        print("Using LINE-ITEM dataset (raw_train.csv, raw_test.csv)")
 
     if config['use_inflation']:
         cpi_data = load_cpi_data()
@@ -366,6 +376,13 @@ def load_and_prepare_data(config):
         # Add dummy column so downstream code doesn't break
         train['contractor_prior_wins'] = 0
         test['contractor_prior_wins'] = 0
+
+    if config.get('use_competition_intensity', False):
+        print("Adding competition intensity feature...")
+        train, test = compute_competition_intensity(train, test)
+    else:
+        train['num_bidders'] = 0
+        test['num_bidders'] = 0
 
     return train, test
 
@@ -422,6 +439,37 @@ def compute_contractor_win_history(train_df, test_df=None):
         test_win_counts = test_bids[['job_id', 'contractor_id', 'contractor_prior_wins']]
         test_df = test_df.merge(test_win_counts, on=['job_id', 'contractor_id'], how='left')
         test_df['contractor_prior_wins'] = test_df['contractor_prior_wins'].fillna(0).astype(int)
+
+        return train_df, test_df
+
+    return train_df
+
+
+def compute_competition_intensity(train_df, test_df=None):
+    """
+    Compute number of bidders per job (competition intensity).
+
+    More bidders typically means more competitive pricing.
+    For training: count unique contractors per job from training data.
+    For test: use training bidder counts for known jobs, median for new jobs.
+    """
+    # Count bidders per job in training data
+    train_bidders = train_df.groupby('job_id')['contractor_id'].nunique().reset_index()
+    train_bidders.columns = ['job_id', 'num_bidders']
+
+    # Merge to training data
+    train_df = train_df.merge(train_bidders, on='job_id', how='left')
+
+    if test_df is not None:
+        # For test jobs that appear in training, use known count
+        # For new test jobs, use median from training
+        test_bidders = test_df.groupby('job_id')['contractor_id'].nunique().reset_index()
+        test_bidders.columns = ['job_id', 'num_bidders']
+        test_df = test_df.merge(test_bidders, on='job_id', how='left')
+
+        # Fill any missing with training median
+        median_bidders = train_bidders['num_bidders'].median()
+        test_df['num_bidders'] = test_df['num_bidders'].fillna(median_bidders)
 
         return train_df, test_df
 
@@ -532,6 +580,9 @@ def aggregate_job_features(df, is_train=True):
 
         # Contractor history
         'contractor_prior_wins': 'first',
+
+        # Competition intensity
+        'num_bidders': 'first',
     }
 
     if is_train:
@@ -605,6 +656,55 @@ def prepare_features(train_agg, test_agg):
 
     # Row IDs for submission
     row_ids = test_agg['job_id'] + '__' + test_agg['contractor_id']
+
+    return X_train, y.values, X_test, row_ids, feature_cols
+
+
+def prepare_features_aggregated(train_df, test_df):
+    """
+    Prepare features for aggregated dataset (train_summary.csv, test.csv).
+    Simpler pipeline without line-item features.
+    """
+    train_df = train_df.copy()
+    test_df = test_df.copy()
+
+    # Extract date features
+    train_df = extract_date_features(train_df)
+    test_df = extract_date_features(test_df)
+
+    # Target
+    y = np.log1p(train_df['total_bid'])
+
+    # Columns to exclude from features
+    exclude_cols = {'job_id', 'contractor_id', 'total_bid', 'bid_date', 'row_id',
+                    'job_category_description', 'primary_location'}
+
+    # Encode categoricals
+    cat_cols = ['job_category_description', 'primary_location']
+    for col in cat_cols:
+        combined = pd.concat([train_df[col], test_df[col]]).astype('category')
+        categories = combined.cat.categories
+        new_col = col + '_cat'
+        train_df[new_col] = train_df[col].astype('category').cat.set_categories(categories).cat.codes
+        test_df[new_col] = test_df[col].astype('category').cat.set_categories(categories).cat.codes
+
+    # Get all numeric feature columns
+    feature_cols = [c for c in train_df.columns if c not in exclude_cols
+                    and c in test_df.columns
+                    and train_df[c].dtype in ['int64', 'float64', 'int32', 'float32']]
+
+    X_train = train_df[feature_cols].copy()
+    X_test = test_df[feature_cols].copy()
+
+    # Fill NaN
+    X_train = X_train.fillna(0)
+    X_test = X_test.fillna(0)
+
+    # Row IDs - use existing row_id column if present, otherwise construct
+    if 'row_id' in test_df.columns:
+        row_ids = test_df['row_id']
+    else:
+        row_ids = test_df['job_id'].astype(str) + '__' + test_df['contractor_id'].astype(str)
 
     return X_train, y.values, X_test, row_ids, feature_cols
 
@@ -777,6 +877,89 @@ def train_and_predict_cv(train_raw, test_raw, config, backend, tuned_params=None
     return predictions, row_ids, cv_scores, importance
 
 
+def train_and_predict_cv_aggregated(train_df, test_df, config, backend, tuned_params=None):
+    """
+    Train model with CV for aggregated dataset.
+    Simpler pipeline without line-item processing.
+    """
+    if tuned_params:
+        params = backend['get_tuned_params'](tuned_params)
+        num_boost_round = tuned_params.get('n_estimators', tuned_params.get('iterations', 1000))
+    else:
+        params = backend['get_default_params'](config)
+        num_boost_round = config['num_boost_round']
+
+    # Parse dates and create job keys
+    train_df = train_df.copy()
+    train_df['bid_date_parsed'] = pd.to_datetime(train_df['bid_date'])
+    train_df['key'] = train_df['job_id'].astype(str) + '__' + train_df['contractor_id'].astype(str)
+
+    # Set up CV strategy
+    n_splits = config['cv_splits']
+    if config['time_based_cv']:
+        train_df = train_df.sort_values('bid_date_parsed').reset_index(drop=True)
+        cv = TimeSeriesSplit(n_splits=n_splits)
+        print("Time-based CV folds:")
+    else:
+        cv = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+        print("Random CV folds:")
+
+    cv_scores = []
+    models = []
+    feature_cols = None
+
+    for fold, (train_idx, val_idx) in enumerate(cv.split(train_df)):
+        train_fold = train_df.iloc[train_idx].copy()
+        val_fold = train_df.iloc[val_idx].copy()
+
+        if config['time_based_cv']:
+            train_date_range = f"{train_fold['bid_date_parsed'].min().date()} to {train_fold['bid_date_parsed'].max().date()}"
+            val_date_range = f"{val_fold['bid_date_parsed'].min().date()} to {val_fold['bid_date_parsed'].max().date()}"
+            print(f"  Fold {fold+1}: Train {train_date_range} ({len(train_idx):,} bids) -> Val {val_date_range} ({len(val_idx):,} bids)")
+        else:
+            print(f"  Fold {fold+1}: Train {len(train_idx):,} bids -> Val {len(val_idx):,} bids")
+
+        # Prepare features
+        X_tr, y_tr, _, _, cols = prepare_features_aggregated(train_fold, val_fold)
+        X_val, y_val, _, _, _ = prepare_features_aggregated(val_fold, train_fold)
+
+        # Align columns
+        if feature_cols is None:
+            feature_cols = cols
+        X_tr = X_tr.reindex(columns=feature_cols, fill_value=0)
+        X_val = X_val.reindex(columns=feature_cols, fill_value=0)
+
+        model = backend['train'](X_tr, y_tr, X_val, y_val, params, num_boost_round)
+        models.append(model)
+
+        y_pred_val = backend['predict'](model, X_val)
+        rmse = np.sqrt(np.mean((y_val - y_pred_val) ** 2))
+        cv_scores.append(rmse)
+        print(f"  Fold {fold+1}: RMSE = {rmse:.4f}")
+
+    print(f"\nCV RMSE: {np.mean(cv_scores):.4f} (+/- {np.std(cv_scores):.4f})")
+
+    # Train final model on all data
+    print("\nTraining final model on all data...")
+    X_train, y_train, X_test, row_ids, _ = prepare_features_aggregated(train_df, test_df)
+    X_train = X_train.reindex(columns=feature_cols, fill_value=0)
+    X_test = X_test.reindex(columns=feature_cols, fill_value=0)
+
+    # Feature importance
+    print("\nTop 20 Feature Importance:")
+    importance = backend['get_feature_importance'](models[-1], feature_cols)
+    print(importance.head(20).to_string(index=False))
+
+    # Train final model
+    final_model = backend['train_final'](X_train, y_train, params, num_boost_round)
+
+    predictions_log = backend['predict'](final_model, X_test)
+    predictions = np.expm1(predictions_log)
+    predictions = np.maximum(predictions, 0)
+
+    return predictions, row_ids, cv_scores, importance
+
+
 def main(config):
     with mlflow.start_run():
         # Log config
@@ -792,35 +975,48 @@ def main(config):
         backend = get_backend(config['model'])
         print(f"\nUsing model: {backend['name']}")
 
-        print("\nLoading raw data...")
-        train_raw, test_raw = load_and_prepare_data(config)
-        print(f"  Train: {train_raw.shape}, Test: {test_raw.shape}")
+        print("\nLoading data...")
+        train_data, test_data = load_and_prepare_data(config)
+        print(f"  Train: {train_data.shape}, Test: {test_data.shape}")
         print(f"CV strategy: {'time-based' if config['time_based_cv'] else 'random'}")
+
+        use_aggregated = config.get('use_aggregated', False)
 
         tuned_params = None
         if config['tune']:
-            # Prepare data for tuning (uses all training data for price lookup)
             print("\nPreparing data for hyperparameter tuning...")
-            item_prices, cat_prices, unit_prices = build_unit_price_lookup(train_raw)
-            train_est = estimate_line_item_cost(train_raw.copy(), item_prices, cat_prices, unit_prices)
-            test_est = estimate_line_item_cost(test_raw.copy(), item_prices, cat_prices, unit_prices)
+            if use_aggregated:
+                # Aggregated path - simpler
+                bid_dates = pd.to_datetime(train_data['bid_date'])
+                X_train, y_train, _, _, _ = prepare_features_aggregated(train_data, test_data)
+            else:
+                # Line-item path - need to build price lookup and aggregate
+                item_prices, cat_prices, unit_prices = build_unit_price_lookup(train_data)
+                train_est = estimate_line_item_cost(train_data.copy(), item_prices, cat_prices, unit_prices)
+                test_est = estimate_line_item_cost(test_data.copy(), item_prices, cat_prices, unit_prices)
 
-            train_agg = aggregate_job_features(train_est, is_train=True)
-            test_agg = aggregate_job_features(test_est, is_train=False)
+                train_agg = aggregate_job_features(train_est, is_train=True)
+                test_agg = aggregate_job_features(test_est, is_train=False)
 
-            # Keep bid_date before prepare_features drops it
-            bid_dates = train_agg['bid_date_first']
+                # Keep bid_date before prepare_features drops it
+                bid_dates = train_agg['bid_date_first']
 
-            X_train, y_train, _, _, _ = prepare_features(train_agg, test_agg)
+                X_train, y_train, _, _, _ = prepare_features(train_agg, test_agg)
+
             tuned_params = tune_hyperparameters(X_train, y_train, backend, bid_dates,
                                                 n_iter=config['tune_iterations'],
                                                 time_based_cv=config['time_based_cv'])
             mlflow.log_params({f"tuned_{k}": v for k, v in tuned_params.items()})
 
         print("\nTraining with CV...")
-        predictions, row_ids, cv_scores, feature_importance = train_and_predict_cv(
-            train_raw, test_raw, config, backend, tuned_params=tuned_params
-        )
+        if use_aggregated:
+            predictions, row_ids, cv_scores, feature_importance = train_and_predict_cv_aggregated(
+                train_data, test_data, config, backend, tuned_params=tuned_params
+            )
+        else:
+            predictions, row_ids, cv_scores, feature_importance = train_and_predict_cv(
+                train_data, test_data, config, backend, tuned_params=tuned_params
+            )
 
         # Log metrics
         mlflow.log_metric("cv_rmse_mean", np.mean(cv_scores))
@@ -843,30 +1039,39 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', choices=['lightgbm', 'xgboost', 'catboost'], help='Model to use')
+    parser.add_argument('--aggregated', action='store_true', help='Use aggregated dataset (train_summary.csv) instead of line-items')
     parser.add_argument('--tune', action='store_true', help='Run hyperparameter tuning')
     parser.add_argument('--tune-iterations', type=int, help='Number of tuning iterations')
     parser.add_argument('--random-cv', action='store_true', help='Use random CV instead of time-based CV')
+    parser.add_argument('--cv-folds', type=int, help='Number of CV folds (default: 5)')
     parser.add_argument('--no-inflation', action='store_true', help='Disable inflation adjustment')
     parser.add_argument('--inflation-lag', type=int, help='Months to lag inflation data')
     parser.add_argument('--contractor-history', action='store_true', help='Add contractor prior wins feature')
+    parser.add_argument('--competition-intensity', action='store_true', help='Add number of bidders per job feature')
     args = parser.parse_args()
 
     # Build config from defaults + CLI overrides
     overrides = {}
     if args.model:
         overrides['model'] = args.model
+    if args.aggregated:
+        overrides['use_aggregated'] = True
     if args.tune:
         overrides['tune'] = True
     if args.tune_iterations:
         overrides['tune_iterations'] = args.tune_iterations
     if args.random_cv:
         overrides['time_based_cv'] = False
+    if args.cv_folds:
+        overrides['cv_splits'] = args.cv_folds
     if args.no_inflation:
         overrides['use_inflation'] = False
     if args.inflation_lag:
         overrides['inflation_lag_months'] = args.inflation_lag
     if args.contractor_history:
         overrides['use_contractor_history'] = True
+    if args.competition_intensity:
+        overrides['use_competition_intensity'] = True
 
     config = get_config(**overrides)
     main(config)

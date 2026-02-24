@@ -22,11 +22,13 @@ Say: "Ready to run. Execute with: `python src/model.py --tune`"
 | `--no-inflation` | flag | Disable CPI inflation adjustment |
 | `--inflation-lag` | int | Months to lag inflation data (0 = same month) |
 | `--contractor-history` | flag | Add contractor prior wins count at bid time |
+| `--competition-intensity` | flag | Add number of bidders per job as feature |
 
 ### Default Config
 - Model: lightgbm
 - Inflation: enabled, no lag
 - Contractor history: disabled
+- Competition intensity: disabled
 - CV: time-based, 5 splits
 - Tuning: disabled
 - num_boost_round: 2000, learning_rate: 0.05

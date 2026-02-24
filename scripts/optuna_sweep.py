@@ -34,8 +34,29 @@ matches the study_name ('model-drift-target-sweep'), not the main experiment.
 
 import os
 import sys
+import urllib.request
+
+from dotenv import load_dotenv
+load_dotenv()
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+
+def notify(title, message):
+    topic = os.environ.get("NTFY_TOPIC")
+    if not topic:
+        print("[ntfy] NTFY_TOPIC not set, skipping notification")
+        return
+    try:
+        req = urllib.request.Request(
+            f"https://ntfy.sh/{topic}",
+            data=message.encode(),
+            headers={"Title": title},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        print(f"[ntfy] notification failed: {e}")
 
 import optuna
 from optuna.integration.mlflow import MLflowCallback
@@ -111,3 +132,9 @@ if __name__ == "__main__":
     print("Best params:")
     for k, v in study.best_params.items():
         print(f"  {k}: {v}")
+
+    best_params_str = ", ".join(f"{k}={v}" for k, v in study.best_params.items())
+    notify(
+        title="Optuna sweep complete",
+        message=f"Best RMSE: {study.best_value:.4f}\n{best_params_str}",
+    )

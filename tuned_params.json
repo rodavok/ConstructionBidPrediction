@@ -21,10 +21,13 @@
     "subsample": 0.6799925076290548
   },
   "catboost": {
-    "bagging_temperature": 0.3180034749718639,
-    "depth": 4,
-    "iterations": 482,
-    "l2_leaf_reg": 4.843970097636307,
-    "learning_rate": 0.12816177191069916
+    "bagging_temperature": 0.5632882178455393,
+    "depth": 5,
+    "iterations": 464,
+    "l2_leaf_reg": 1.1436962699819277,
+    "learning_rate": 0.057707259074657874
+  },
+  "stacking": {
+    "final_estimator__alpha": 17.71884735480682
   }
 }

@@ -130,6 +130,7 @@ cython_debug/
 # Project-specific
 # Data (too large for git)
 *.csv
+*.tsv
 
 # Saved models
 models/*.pkl

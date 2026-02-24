@@ -21,12 +21,17 @@ Say: "Ready to run. Execute with: `python src/model.py --tune`"
 | `--random-cv` | flag | Use random KFold CV instead of time-based CV |
 | `--no-inflation` | flag | Disable CPI inflation adjustment |
 | `--inflation-lag` | int | Months to lag inflation data (0 = same month) |
+| `--log-inflation` | flag | Log-transform inflation factors (symmetric scale, better for linear models) |
 | `--contractor-history` | flag | Add contractor prior wins count at bid time |
 | `--competition-intensity` | flag | Add number of bidders per job as feature |
+| `--gpu` | flag | Enable GPU acceleration (CUDA for XGBoost/CatBoost, OpenCL for LightGBM) |
+| `--recency-weight` | float | Exponential decay factor for recency weighting (0=uniform, 1=~37% weight to 1-year-old bids, 2=~14%) |
+| `--markup-ratio` | flag | Predict log(bid/estimated_cost) instead of log(bid); model learns contractor markup. CV RMSE still reported in log-bid space for comparability. |
+| `--train-from` | str | ISO date (e.g. `2022-07-01`). Model trains only on bids from this date onward; price lookup still uses all data for full pay-item coverage. |
 
 ### Default Config
 - Model: lightgbm
-- Inflation: enabled, no lag
+- Inflation: enabled, no lag, raw factors (not log-transformed)
 - Contractor history: disabled
 - Competition intensity: disabled
 - CV: time-based, 5 splits
@@ -46,6 +51,10 @@ All runs are tracked under the `construction-price-prediction` experiment.
 **Logged artifacts:**
 - `feature_importance.csv`
 - `submission.csv`
+
+**When analyzing runs:**
+- Ignore runs with `--random-cv` (time_based_cv=False) — random CV leaks future data on this time-dependent problem
+- Ignore runs before `mysterious-lamb-949` — earlier runs had a bug where `amount` was incorrectly divided by `quantity` (amount IS already the unit price)
 
 ---
 

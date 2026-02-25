@@ -521,12 +521,13 @@ def get_elasticnet_backend():
     }
 
 
-def get_stacking_backend(stack_models=None):
+def get_stacking_backend(stack_models=None, stacking_model_params=None, use_gpu=False):
     """
     Stacking ensemble with configurable base models. Ridge as meta-learner.
     Uses out-of-fold predictions to train the meta-model (no leakage).
 
     Base model hyperparameters are loaded from tuned_params.json if available.
+    stacking_model_params overrides tuned params (used by the Optuna sweep).
     Run each model with --tune first to populate the file:
         python src/model.py --model lightgbm --tune
         python src/model.py --model stacking --stack-models lightgbm elasticnet
@@ -542,8 +543,10 @@ def get_stacking_backend(stack_models=None):
     if stack_models is None:
         stack_models = ['lightgbm', 'xgboost', 'catboost']
 
-    # Store for use in get_feature_importance
+    # Store for use in closures
     _stack_models = stack_models
+    _stacking_model_params = stacking_model_params or {}
+    _use_gpu = use_gpu
 
     def _make_estimator(name, saved_params):
         """Create a single base estimator by name."""
@@ -562,6 +565,8 @@ def get_stacking_backend(stack_models=None):
                 'n_jobs': -1,
                 'random_state': 42,
             }
+            if _use_gpu:
+                params.update({'device': 'gpu', 'gpu_platform_id': 0, 'gpu_device_id': 0})
             return ('lgb', lgb.LGBMRegressor(**params))
 
         elif name == 'xgboost':
@@ -577,6 +582,8 @@ def get_stacking_backend(stack_models=None):
                 'n_jobs': -1,
                 'random_state': 42,
             }
+            if _use_gpu:
+                params.update({'device': 'cuda', 'tree_method': 'hist'})
             return ('xgb', xgb.XGBRegressor(**params))
 
         elif name == 'catboost':
@@ -589,6 +596,8 @@ def get_stacking_backend(stack_models=None):
                 'verbose': False,
                 'random_seed': 42,
             }
+            if _use_gpu:
+                params.update({'task_type': 'GPU', 'devices': '0'})
             return ('catboost', CatBoostRegressor(**params))
 
         elif name == 'ridge':
@@ -616,15 +625,23 @@ def get_stacking_backend(stack_models=None):
             raise ValueError(f"Unknown model for stacking: {name}")
 
     def _make_base_estimators():
-        """Create base estimators for stacking, using tuned params if available."""
+        """Create base estimators for stacking.
+
+        Priority: stacking_model_params (trial overrides) > tuned_params.json > defaults.
+        """
         saved = load_tuned_params()
         estimators = []
 
         for name in _stack_models:
-            model_params = saved.get(name, {})
-            if model_params:
+            if _stacking_model_params.get(name):
+                # Trial-level overrides take priority (Optuna sweep)
+                model_params = {**saved.get(name, {}), **_stacking_model_params[name]}
+                print(f"  {name}: using trial params")
+            elif saved.get(name):
+                model_params = saved[name]
                 print(f"  {name}: using tuned params")
             else:
+                model_params = {}
                 print(f"  {name}: using defaults (run --model {name} --tune to tune)")
             estimators.append(_make_estimator(name, model_params))
 
@@ -632,11 +649,13 @@ def get_stacking_backend(stack_models=None):
 
     def _make_stacking_model(final_alpha=1.0):
         """Create the stacking regressor."""
+        # Use n_jobs=1 when GPU is active to avoid parallel processes competing for GPU memory
+        stacking_n_jobs = 1 if _use_gpu else -1
         return StackingRegressor(
             estimators=_make_base_estimators(),
             final_estimator=Ridge(alpha=final_alpha),
             cv=5,  # 5-fold CV for generating meta-features
-            n_jobs=-1,
+            n_jobs=stacking_n_jobs,
             passthrough=False,  # Only use base model predictions as meta-features
         )
 
@@ -755,7 +774,11 @@ def get_backend(name, config=None):
     if name not in backends:
         raise ValueError(f"Unknown model: {name}. Choose from: {list(backends.keys())}")
     if name == 'stacking' and config is not None:
-        return backends[name](stack_models=config.get('stack_models', ['lightgbm', 'xgboost', 'catboost']))
+        return backends[name](
+            stack_models=config.get('stack_models', ['lightgbm', 'xgboost', 'catboost']),
+            stacking_model_params=config.get('stacking_model_params', {}),
+            use_gpu=config.get('use_gpu', False),
+        )
     return backends[name]()
 
 
@@ -766,6 +789,7 @@ DEFAULT_CONFIG = {
     # Model selection
     'model': 'lightgbm',  # 'lightgbm', 'xgboost', 'catboost'
     'stack_models': ['lightgbm', 'xgboost', 'catboost'],  # Base models for stacking
+    'stacking_model_params': {},  # Per-model param overrides for stacking (used by Optuna sweep)
 
     # Data source
     'use_aggregated': False,  # True = train_summary.csv/test.csv, False = raw_train.csv/raw_test.csv

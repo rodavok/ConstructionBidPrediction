@@ -1358,6 +1358,7 @@ def train_and_predict_cv(train_raw, test_raw, config, backend, tuned_params=None
         print("Random CV folds:")
 
     cv_scores = []
+    cv_mae_scores = []
     models = []
     feature_cols = None
 
@@ -1424,12 +1425,16 @@ def train_and_predict_cv(train_raw, test_raw, config, backend, tuned_params=None
             cost_val = np.maximum(val_agg['estimated_cost_sum'].values, 1.0)
             y_pred_log_bid = y_pred_val + np.log(cost_val)
             rmse = np.sqrt(np.mean((y_val - y_pred_log_bid) ** 2))
+            mae = np.mean(np.abs(y_val - y_pred_log_bid))
         else:
             rmse = np.sqrt(np.mean((y_val - y_pred_val) ** 2))
+            mae = np.mean(np.abs(y_val - y_pred_val))
         cv_scores.append(rmse)
-        print(f"  Fold {fold+1}: RMSE = {rmse:.4f}")
+        cv_mae_scores.append(mae)
+        print(f"  Fold {fold+1}: RMSE = {rmse:.4f}, MAE = {mae:.4f}")
 
     print(f"\nCV RMSE: {np.mean(cv_scores):.4f} (+/- {np.std(cv_scores):.4f})")
+    print(f"CV MAE:  {np.mean(cv_mae_scores):.4f} (+/- {np.std(cv_mae_scores):.4f})")
 
     # For final predictions, use all training data
     print("\nTraining final model on all data...")
@@ -1467,7 +1472,7 @@ def train_and_predict_cv(train_raw, test_raw, config, backend, tuned_params=None
         predictions = np.expm1(predictions_log)
     predictions = np.maximum(predictions, 0)
 
-    return predictions, row_ids, cv_scores, importance
+    return predictions, row_ids, cv_scores, cv_mae_scores, importance
 
 
 def train_and_predict_cv_aggregated(train_df, test_df, config, backend, tuned_params=None):
@@ -1501,6 +1506,7 @@ def train_and_predict_cv_aggregated(train_df, test_df, config, backend, tuned_pa
         print("Random CV folds:")
 
     cv_scores = []
+    cv_mae_scores = []
     models = []
     feature_cols = None
 
@@ -1534,10 +1540,13 @@ def train_and_predict_cv_aggregated(train_df, test_df, config, backend, tuned_pa
 
         y_pred_val = backend['predict'](model, X_val)
         rmse = np.sqrt(np.mean((y_val - y_pred_val) ** 2))
+        mae = np.mean(np.abs(y_val - y_pred_val))
         cv_scores.append(rmse)
-        print(f"  Fold {fold+1}: RMSE = {rmse:.4f}")
+        cv_mae_scores.append(mae)
+        print(f"  Fold {fold+1}: RMSE = {rmse:.4f}, MAE = {mae:.4f}")
 
     print(f"\nCV RMSE: {np.mean(cv_scores):.4f} (+/- {np.std(cv_scores):.4f})")
+    print(f"CV MAE:  {np.mean(cv_mae_scores):.4f} (+/- {np.std(cv_mae_scores):.4f})")
 
     # Train final model on all data
     print("\nTraining final model on all data...")
@@ -1559,7 +1568,7 @@ def train_and_predict_cv_aggregated(train_df, test_df, config, backend, tuned_pa
     predictions = np.expm1(predictions_log)
     predictions = np.maximum(predictions, 0)
 
-    return predictions, row_ids, cv_scores, importance
+    return predictions, row_ids, cv_scores, cv_mae_scores, importance
 
 
 def main(config):
@@ -1630,11 +1639,11 @@ def main(config):
 
         print("\nTraining with CV...")
         if use_aggregated:
-            predictions, row_ids, cv_scores, feature_importance = train_and_predict_cv_aggregated(
+            predictions, row_ids, cv_scores, cv_mae_scores, feature_importance = train_and_predict_cv_aggregated(
                 train_data, test_data, config, backend, tuned_params=tuned_params
             )
         else:
-            predictions, row_ids, cv_scores, feature_importance = train_and_predict_cv(
+            predictions, row_ids, cv_scores, cv_mae_scores, feature_importance = train_and_predict_cv(
                 train_data, test_data, config, backend, tuned_params=tuned_params,
                 price_lookup_data=price_lookup_data,
             )
@@ -1644,6 +1653,21 @@ def main(config):
         mlflow.log_metric("cv_rmse_std", np.std(cv_scores))
         for i, score in enumerate(cv_scores):
             mlflow.log_metric(f"cv_rmse_fold_{i+1}", score)
+
+        mlflow.log_metric("cv_mae_mean", np.mean(cv_mae_scores))
+        mlflow.log_metric("cv_mae_std", np.std(cv_mae_scores))
+        for i, score in enumerate(cv_mae_scores):
+            mlflow.log_metric(f"cv_mae_fold_{i+1}", score)
+
+        # Fold trend: last fold minus first fold (positive = degrades over time)
+        if len(cv_scores) >= 2:
+            mlflow.log_metric("cv_fold_trend", cv_scores[-1] - cv_scores[0])
+
+        # Test prediction distribution (log space)
+        test_pred_log = np.log1p(np.maximum(predictions, 0))
+        mlflow.log_metric("test_pred_mean", float(np.mean(test_pred_log)))
+        mlflow.log_metric("test_pred_std", float(np.std(test_pred_log)))
+        mlflow.log_metric("test_pred_iqr", float(np.percentile(test_pred_log, 75) - np.percentile(test_pred_log, 25)))
 
         # Log feature importance as artifact
         feature_importance.to_csv("feature_importance.csv", index=False)

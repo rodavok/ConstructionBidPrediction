@@ -132,6 +132,8 @@ cython_debug/
 *.csv
 *.tsv
 
+catboost_info/*
+
 # Saved models
 models/*.pkl
 models/*.joblib

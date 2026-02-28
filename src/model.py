@@ -521,6 +521,77 @@ def get_elasticnet_backend():
     }
 
 
+def get_random_forest_backend():
+    from sklearn.ensemble import RandomForestRegressor
+
+    def get_default_params(_config):
+        return {
+            'n_estimators': 500,
+            'max_depth': None,
+            'min_samples_split': 5,
+            'min_samples_leaf': 2,
+            'max_features': 'sqrt',
+            'bootstrap': True,
+            'n_jobs': -1,
+            'random_state': 42,
+        }
+
+    def get_tuned_params(tuned):
+        return {
+            'n_estimators': tuned.get('n_estimators', 500),
+            'max_depth': tuned.get('max_depth', None),
+            'min_samples_split': tuned.get('min_samples_split', 5),
+            'min_samples_leaf': tuned.get('min_samples_leaf', 2),
+            'max_features': tuned.get('max_features', 'sqrt'),
+            'bootstrap': tuned.get('bootstrap', True),
+            'n_jobs': -1,
+            'random_state': 42,
+        }
+
+    def get_tune_distributions():
+        return {
+            'n_estimators': randint(200, 800),
+            'max_depth': [None, 10, 15, 20, 25, 30],
+            'min_samples_split': randint(2, 20),
+            'min_samples_leaf': randint(1, 10),
+            'max_features': ['sqrt', 'log2', 0.5, 0.7],
+        }
+
+    def get_tuning_model():
+        return RandomForestRegressor(n_jobs=-1, random_state=42)
+
+    def train(X_tr, y_tr, _X_val, _y_val, params, _num_boost_round, sample_weight=None):
+        model = RandomForestRegressor(**params)
+        model.fit(X_tr, y_tr, sample_weight=sample_weight)
+        return model
+
+    def train_final(X_train, y_train, params, _num_boost_round, sample_weight=None):
+        model = RandomForestRegressor(**params)
+        model.fit(X_train, y_train, sample_weight=sample_weight)
+        return model
+
+    def predict(model, X):
+        return model.predict(X)
+
+    def get_feature_importance(model, feature_cols):
+        return pd.DataFrame({
+            'feature': feature_cols,
+            'importance': model.feature_importances_
+        }).sort_values('importance', ascending=False)
+
+    return {
+        'name': 'randomforest',
+        'get_default_params': get_default_params,
+        'get_tuned_params': get_tuned_params,
+        'get_tune_distributions': get_tune_distributions,
+        'get_tuning_model': get_tuning_model,
+        'train': train,
+        'train_final': train_final,
+        'predict': predict,
+        'get_feature_importance': get_feature_importance,
+    }
+
+
 def get_stacking_backend(stack_models=None, stacking_model_params=None, use_gpu=False):
     """
     Stacking ensemble with configurable base models. Ridge as meta-learner.
@@ -536,7 +607,7 @@ def get_stacking_backend(stack_models=None, stacking_model_params=None, use_gpu=
     import xgboost as xgb
     from catboost import CatBoostRegressor
     from sklearn.linear_model import Ridge, ElasticNet
-    from sklearn.ensemble import StackingRegressor
+    from sklearn.ensemble import StackingRegressor, RandomForestRegressor
     from sklearn.preprocessing import StandardScaler
     from sklearn.pipeline import Pipeline
 
@@ -620,6 +691,18 @@ def get_stacking_backend(stack_models=None, stacking_model_params=None, use_gpu=
                 ('scaler', StandardScaler()),
                 ('elasticnet', ElasticNet(**params))
             ]))
+
+        elif name == 'randomforest':
+            params = {
+                'n_estimators': saved_params.get('n_estimators', 500),
+                'max_depth': saved_params.get('max_depth', None),
+                'min_samples_split': saved_params.get('min_samples_split', 5),
+                'min_samples_leaf': saved_params.get('min_samples_leaf', 2),
+                'max_features': saved_params.get('max_features', 'sqrt'),
+                'n_jobs': -1,
+                'random_state': 42,
+            }
+            return ('rf', RandomForestRegressor(**params))
 
         else:
             raise ValueError(f"Unknown model for stacking: {name}")
@@ -769,6 +852,7 @@ def get_backend(name, config=None):
         'catboost': get_catboost_backend,
         'ridge': get_ridge_backend,
         'elasticnet': get_elasticnet_backend,
+        'randomforest': get_random_forest_backend,
         'stacking': get_stacking_backend,
     }
     if name not in backends:
@@ -800,6 +884,7 @@ DEFAULT_CONFIG = {
     'log_inflation': False,  # Log-transform inflation factors (better for linear models)
     'use_contractor_history': False,  # Add contractor win count at bid time
     'use_competition_intensity': False,  # Add number of bidders per job
+    'use_loc_cat_interaction': False,  # Add location × category mean/std/count features
 
     # Recency weighting: exponential decay factor (0 = uniform, 1 = sample from 1 year
     # ago weighted at exp(-1)≈0.37x relative to the most recent sample)
@@ -810,6 +895,11 @@ DEFAULT_CONFIG = {
     # Final predictions are decoded as exp(markup_pred) * estimated_cost.
     # CV RMSE is always reported in log-bid space for comparability.
     'use_markup_target': False,
+
+    # Bias correction: shift final predictions by the mean OOF residual (in log space).
+    # Corrects systematic under/over-prediction. Bias is computed from CV folds and
+    # applied as an additive offset to log-space test predictions before decoding.
+    'use_bias_correction': False,
 
     # Restrict model training to bids on or after this date (ISO format, e.g. '2022-07-01').
     # The price lookup (estimated_cost features) still uses ALL training data to maximise
@@ -1012,6 +1102,46 @@ def compute_competition_intensity(train_df, test_df=None):
         return train_df, test_df
 
     return train_df
+
+
+def add_loc_cat_features(train_agg, other_agg):
+    """
+    Add location × category interaction features derived from training data only.
+
+    Computes per-(location, category) statistics of log-bid from train_agg and merges
+    them into both train_agg and other_agg (val or test fold).  Using training stats
+    only avoids leakage.  Three features are added:
+      - loc_cat_mean:  mean log1p(total_bid) for this (location, category) pair
+      - loc_cat_std:   std of log1p(total_bid) (spread of bids for the pair)
+      - loc_cat_count: number of training bids seen for this pair (lets the model
+                       discount uncertain estimates for thin combinations)
+
+    Missing combinations in other_agg are filled with global training mean / 0 / 0.
+    """
+    group_cols = ['primary_location_first', 'job_category_description_first']
+
+    log_bids = np.log1p(train_agg['total_bid_first'])
+    global_mean = float(log_bids.mean())
+
+    stats = (
+        train_agg.assign(_log_bid=log_bids)
+        .groupby(group_cols)['_log_bid']
+        .agg(['mean', 'std', 'count'])
+        .reset_index()
+        .rename(columns={'mean': 'loc_cat_mean', 'std': 'loc_cat_std', 'count': 'loc_cat_count'})
+    )
+
+    train_agg = train_agg.merge(stats, on=group_cols, how='left')
+    train_agg['loc_cat_mean'] = train_agg['loc_cat_mean'].fillna(global_mean)
+    train_agg['loc_cat_std'] = train_agg['loc_cat_std'].fillna(0)
+    train_agg['loc_cat_count'] = train_agg['loc_cat_count'].fillna(0)
+
+    other_agg = other_agg.merge(stats, on=group_cols, how='left')
+    other_agg['loc_cat_mean'] = other_agg['loc_cat_mean'].fillna(global_mean)
+    other_agg['loc_cat_std'] = other_agg['loc_cat_std'].fillna(0)
+    other_agg['loc_cat_count'] = other_agg['loc_cat_count'].fillna(0)
+
+    return train_agg, other_agg
 
 
 def build_unit_price_lookup(train_df):
@@ -1361,6 +1491,10 @@ def train_and_predict_cv(train_raw, test_raw, config, backend, tuned_params=None
     cv_mae_scores = []
     models = []
     feature_cols = None
+    oof_actuals = []       # log-bid actuals across all folds
+    oof_preds = []         # log-bid predictions across all folds (decoded if markup target)
+    oof_job_ids = []       # job_id per OOF sample
+    oof_contractor_ids = []  # contractor_id per OOF sample
 
     for fold, (train_idx, val_idx) in enumerate(cv.split(job_keys)):
         train_keys_df = job_keys.iloc[train_idx]
@@ -1396,6 +1530,9 @@ def train_and_predict_cv(train_raw, test_raw, config, backend, tuned_params=None
         train_agg = aggregate_job_features(train_fold, is_train=True, log_inflation=log_inf)
         val_agg = aggregate_job_features(val_fold, is_train=True, log_inflation=log_inf)
 
+        if config.get('use_loc_cat_interaction', False):
+            train_agg, val_agg = add_loc_cat_features(train_agg, val_agg)
+
         # Prepare features
         X_tr, y_tr, _, _, cols = prepare_features(train_agg.copy(), val_agg.copy())
         X_val, y_val, _, _, _ = prepare_features(val_agg.copy(), train_agg.copy())
@@ -1426,15 +1563,28 @@ def train_and_predict_cv(train_raw, test_raw, config, backend, tuned_params=None
             y_pred_log_bid = y_pred_val + np.log(cost_val)
             rmse = np.sqrt(np.mean((y_val - y_pred_log_bid) ** 2))
             mae = np.mean(np.abs(y_val - y_pred_log_bid))
+            oof_preds.extend(y_pred_log_bid.tolist())
         else:
             rmse = np.sqrt(np.mean((y_val - y_pred_val) ** 2))
             mae = np.mean(np.abs(y_val - y_pred_val))
+            oof_preds.extend(y_pred_val.tolist())
+        oof_actuals.extend(y_val.tolist())
+        oof_job_ids.extend(val_keys_df['job_id'].tolist())
+        oof_contractor_ids.extend(val_keys_df['contractor_id'].tolist())
         cv_scores.append(rmse)
         cv_mae_scores.append(mae)
         print(f"  Fold {fold+1}: RMSE = {rmse:.4f}, MAE = {mae:.4f}")
 
     print(f"\nCV RMSE: {np.mean(cv_scores):.4f} (+/- {np.std(cv_scores):.4f})")
     print(f"CV MAE:  {np.mean(cv_mae_scores):.4f} (+/- {np.std(cv_mae_scores):.4f})")
+
+    # Bias correction: mean residual (actual - pred) in log-bid space across all OOF folds.
+    # Positive = model under-predicts on average; will be added to test predictions if enabled.
+    oof_bias = float(np.mean(np.array(oof_actuals) - np.array(oof_preds)))
+    print(f"OOF bias (log space): {oof_bias:+.4f} ({'under' if oof_bias > 0 else 'over'}-predicting by {abs(oof_bias):.4f})")
+    bias_correction = oof_bias if config.get('use_bias_correction', False) else 0.0
+    if config.get('use_bias_correction', False):
+        print(f"Bias correction ENABLED: applying {bias_correction:+.4f} to log-space predictions")
 
     # For final predictions, use all training data
     print("\nTraining final model on all data...")
@@ -1445,6 +1595,9 @@ def train_and_predict_cv(train_raw, test_raw, config, backend, tuned_params=None
 
     train_agg = aggregate_job_features(train_raw_est, is_train=True, log_inflation=log_inf)
     test_agg = aggregate_job_features(test_raw_est, is_train=False, log_inflation=log_inf)
+
+    if config.get('use_loc_cat_interaction', False):
+        train_agg, test_agg = add_loc_cat_features(train_agg, test_agg)
 
     X_train, y_train, X_test, row_ids, _ = prepare_features(train_agg, test_agg)
     X_train = X_train.reindex(columns=feature_cols, fill_value=0)
@@ -1464,7 +1617,7 @@ def train_and_predict_cv(train_raw, test_raw, config, backend, tuned_params=None
     final_model = backend['train_final'](X_train, y_train, params, num_boost_round,
                                          sample_weight=final_weight)
 
-    predictions_log = backend['predict'](final_model, X_test)
+    predictions_log = backend['predict'](final_model, X_test) + bias_correction
     if config.get('use_markup_target', False):
         test_cost = np.maximum(test_agg['estimated_cost_sum'].values, 1.0)
         predictions = np.exp(predictions_log) * test_cost
@@ -1472,7 +1625,14 @@ def train_and_predict_cv(train_raw, test_raw, config, backend, tuned_params=None
         predictions = np.expm1(predictions_log)
     predictions = np.maximum(predictions, 0)
 
-    return predictions, row_ids, cv_scores, cv_mae_scores, importance
+    oof_df = pd.DataFrame({
+        'job_id': oof_job_ids,
+        'contractor_id': oof_contractor_ids,
+        'actual_log': oof_actuals,
+        'pred_log': oof_preds,
+    })
+
+    return predictions, row_ids, cv_scores, cv_mae_scores, importance, oof_bias, oof_df
 
 
 def train_and_predict_cv_aggregated(train_df, test_df, config, backend, tuned_params=None):
@@ -1573,8 +1733,9 @@ def train_and_predict_cv_aggregated(train_df, test_df, config, backend, tuned_pa
 
 def main(config):
     with mlflow.start_run(nested=bool(mlflow.active_run())):
-        # Log config
-        mlflow.log_params(config)
+        # Log config (exclude internal dict keys not suitable as flat params)
+        _skip_log = {'model_params', 'stacking_model_params'}
+        mlflow.log_params({k: v for k, v in config.items() if k not in _skip_log})
 
         print("=" * 60)
         print("EXPERIMENT CONFIG:")
@@ -1606,8 +1767,11 @@ def main(config):
         print(f"CV strategy: {'time-based' if config['time_based_cv'] else 'random'}")
 
         use_aggregated = config.get('use_aggregated', False)
+        oof_bias = 0.0  # populated by train_and_predict_cv; stays 0 for aggregated path
+        oof_df = None   # populated by train_and_predict_cv; None for aggregated path
 
-        tuned_params = None
+        # Allow callers (e.g. sweep scripts) to inject pre-set params directly
+        tuned_params = config.get('model_params', None)
         if config['tune']:
             print("\nPreparing data for hyperparameter tuning...")
             if use_aggregated:
@@ -1643,7 +1807,7 @@ def main(config):
                 train_data, test_data, config, backend, tuned_params=tuned_params
             )
         else:
-            predictions, row_ids, cv_scores, cv_mae_scores, feature_importance = train_and_predict_cv(
+            predictions, row_ids, cv_scores, cv_mae_scores, feature_importance, oof_bias, oof_df = train_and_predict_cv(
                 train_data, test_data, config, backend, tuned_params=tuned_params,
                 price_lookup_data=price_lookup_data,
             )
@@ -1663,6 +1827,9 @@ def main(config):
         if len(cv_scores) >= 2:
             mlflow.log_metric("cv_fold_trend", cv_scores[-1] - cv_scores[0])
 
+        # OOF bias (always logged; non-zero only from line-item path)
+        mlflow.log_metric("oof_bias", oof_bias)
+
         # Test prediction distribution (log space)
         test_pred_log = np.log1p(np.maximum(predictions, 0))
         mlflow.log_metric("test_pred_mean", float(np.mean(test_pred_log)))
@@ -1672,6 +1839,11 @@ def main(config):
         # Log feature importance as artifact
         feature_importance.to_csv("feature_importance.csv", index=False)
         mlflow.log_artifact("feature_importance.csv")
+
+        # Log OOF predictions for post-hoc error analysis
+        if oof_df is not None:
+            oof_df.to_csv("oof_predictions.csv", index=False)
+            mlflow.log_artifact("oof_predictions.csv")
 
         print("\nCreating submission...")
         run_id = mlflow.active_run().info.run_id
@@ -1694,8 +1866,8 @@ def main(config):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', choices=['lightgbm', 'xgboost', 'catboost', 'ridge', 'elasticnet', 'stacking'], help='Model to use')
-    parser.add_argument('--stack-models', nargs='+', choices=['lightgbm', 'xgboost', 'catboost', 'ridge', 'elasticnet'],
+    parser.add_argument('--model', choices=['lightgbm', 'xgboost', 'catboost', 'ridge', 'elasticnet', 'randomforest', 'stacking'], help='Model to use')
+    parser.add_argument('--stack-models', nargs='+', choices=['lightgbm', 'xgboost', 'catboost', 'ridge', 'elasticnet', 'randomforest'],
                         help='Base models for stacking (e.g., --stack-models lightgbm elasticnet)')
     parser.add_argument('--aggregated', action='store_true', help='Use aggregated dataset (train_summary.csv) instead of line-items')
     parser.add_argument('--tune', action='store_true', help='Run hyperparameter tuning')
@@ -1707,9 +1879,11 @@ if __name__ == "__main__":
     parser.add_argument('--log-inflation', action='store_true', help='Log-transform inflation factors')
     parser.add_argument('--contractor-history', action='store_true', help='Add contractor prior wins feature')
     parser.add_argument('--competition-intensity', action='store_true', help='Add number of bidders per job feature')
+    parser.add_argument('--loc-cat-interaction', action='store_true', help='Add location × category mean/std/count features (computed from training fold only)')
     parser.add_argument('--gpu', action='store_true', help='Enable GPU acceleration (CUDA for XGBoost/CatBoost, OpenCL for LightGBM)')
     parser.add_argument('--recency-weight', type=float, help='Exponential decay factor for recency weighting (0=uniform, 1=~37%% weight to 1-year-old bids)')
     parser.add_argument('--markup-ratio', action='store_true', help='Predict log(bid/estimated_cost) instead of log(bid); model learns contractor markup patterns')
+    parser.add_argument('--bias-correction', action='store_true', help='Shift test predictions by the mean OOF residual (corrects systematic under/over-prediction)')
     parser.add_argument('--train-from', type=str, help='Only train model on bids from this date onward (ISO format, e.g. 2022-07-01). Price lookup still uses all data.')
     args = parser.parse_args()
 
@@ -1737,12 +1911,16 @@ if __name__ == "__main__":
         overrides['use_contractor_history'] = True
     if args.competition_intensity:
         overrides['use_competition_intensity'] = True
+    if args.loc_cat_interaction:
+        overrides['use_loc_cat_interaction'] = True
     if args.gpu:
         overrides['use_gpu'] = True
     if args.recency_weight is not None:
         overrides['recency_weight'] = args.recency_weight
     if args.markup_ratio:
         overrides['use_markup_target'] = True
+    if args.bias_correction:
+        overrides['use_bias_correction'] = True
     if args.train_from:
         overrides['train_from'] = args.train_from
     if args.stack_models:

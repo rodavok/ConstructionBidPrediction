@@ -15,9 +15,10 @@ Changes from v1:
   5. Duplicate detection — skips combos already run in any prior sweep
 
 Discrete space size:
-  8 stacks × 2 markup × 4 recency × 3 train_from × 2 contractor × 2 competition
-    × [1 (no-inflation) + 2×3 (inflation variants)]
-  = 8 × 2 × 4 × 3 × 2 × 2 × 7 = 5,376 combinations
+  11 stacks × 2 markup × 4 recency × 3 train_from × 2 contractor × 2 competition
+    × [1 (no-inflation) + 2×3 (inflation variants)] × 2 loc_cat
+  = 11 × 2 × 4 × 3 × 2 × 2 × 7 × 2 = 14,784 combinations
+  bias_correction pinned to True (doesn't affect CV RMSE, model consistently under-predicts)
 
 MLflow experiment: stacking-sweep-v2
 Default trials: 50 (runs faster with pinned hyperparams)
@@ -45,14 +46,17 @@ STUDY_NAME = "stacking-sweep-v2"
 
 # Curated stack combinations — covers promising subsets without over-representing any one
 STACK_OPTIONS = [
-    ["lightgbm", "catboost", "elasticnet"],             # 0: best stacking-sweep run (3d67adaf)
-    ["lightgbm", "xgboost", "catboost"],                # 1: best Kaggle run (a932d990)
-    ["lightgbm", "xgboost", "catboost", "elasticnet"],  # 2: all 4 models
-    ["xgboost", "catboost", "elasticnet"],              # 3: underexplored 3-combo
-    ["lightgbm", "xgboost", "elasticnet"],              # 4: underexplored 3-combo
-    ["lightgbm", "catboost"],                           # 5: lean 2-model
-    ["lightgbm", "xgboost"],                            # 6: lean 2-model
-    ["xgboost", "catboost"],                            # 7: lean 2-model
+    ["lightgbm", "catboost", "elasticnet"],                      # 0: best stacking-sweep run (3d67adaf)
+    ["lightgbm", "xgboost", "catboost"],                         # 1: best Kaggle run (a932d990)
+    ["lightgbm", "xgboost", "catboost", "elasticnet"],           # 2: all 4 GBM+linear models
+    ["xgboost", "catboost", "elasticnet"],                       # 3: underexplored 3-combo
+    ["lightgbm", "xgboost", "elasticnet"],                       # 4: underexplored 3-combo
+    ["lightgbm", "catboost"],                                    # 5: lean 2-model
+    ["lightgbm", "xgboost"],                                     # 6: lean 2-model
+    ["xgboost", "catboost"],                                     # 7: lean 2-model
+    ["lightgbm", "xgboost", "catboost", "randomforest"],         # 8: best Kaggle + RF
+    ["lightgbm", "catboost", "randomforest"],                    # 9: 3-combo + RF
+    ["lightgbm", "xgboost", "catboost", "elasticnet", "randomforest"],  # 10: all models
 ]
 
 # Pinned per-model hyperparams from best known runs
@@ -96,6 +100,7 @@ COMBO_KEYS = [
     "train_from",
     "use_contractor_history",
     "use_competition_intensity",
+    "use_loc_cat_interaction",
 ]
 
 
@@ -176,6 +181,7 @@ def load_existing_combos() -> set:
                 train_from = None
             use_contractor = p.get("use_contractor_history", "False") == "True"
             use_competition = p.get("use_competition_intensity", "False") == "True"
+            use_loc_cat = p.get("use_loc_cat_interaction", "False") == "True"
 
             combo = make_combo({
                 "stack_idx": stack_idx,
@@ -187,6 +193,7 @@ def load_existing_combos() -> set:
                 "train_from": train_from,
                 "use_contractor_history": use_contractor,
                 "use_competition_intensity": use_competition,
+                "use_loc_cat_interaction": use_loc_cat,
             })
             existing.add(combo)
 
@@ -244,6 +251,7 @@ def objective(trial):
     train_from = trial.suggest_categorical("train_from", [None, "2022-01-01", "2022-07-01"])
     use_contractor = trial.suggest_categorical("use_contractor_history", [True, False])
     use_competition = trial.suggest_categorical("use_competition_intensity", [True, False])
+    use_loc_cat = trial.suggest_categorical("use_loc_cat_interaction", [True, False])
 
     # --- Duplicate detection ---
     combo = make_combo({
@@ -256,6 +264,7 @@ def objective(trial):
         "train_from": train_from,
         "use_contractor_history": use_contractor,
         "use_competition_intensity": use_competition,
+        "use_loc_cat_interaction": use_loc_cat,
     })
 
     if combo in _seen_combos:
@@ -287,6 +296,8 @@ def objective(trial):
         "use_inflation": use_inflation,
         "inflation_lag_months": inflation_lag,
         "log_inflation": log_inflation,
+        "use_loc_cat_interaction": use_loc_cat,
+        "use_bias_correction": True,
         "use_gpu": True,
         "tune": False,
     })
@@ -320,7 +331,7 @@ if __name__ == "__main__":
 
     print(f"Starting stacking sweep v2: up to {args.trials} trials (RandomSampler)")
     print("Sweep axes:")
-    print("  Stack combos (8):  see STACK_OPTIONS in script")
+    print("  Stack combos (11): see STACK_OPTIONS in script")
     print("  use_inflation:     [True, False]")
     print("    log_inflation:   [True, False]  (when inflation=True)")
     print("    inflation_lag:   [0, 3, 6]      (when inflation=True)")
@@ -329,8 +340,9 @@ if __name__ == "__main__":
     print("  train_from:        [None, 2022-01-01, 2022-07-01]")
     print("  use_contractor_history:    [True, False]")
     print("  use_competition_intensity: [True, False]")
-    print("Pinned: per-model hyperparams from best known runs; gpu=True; tune=False")
-    print(f"Total discrete space: 5,376 combinations (~{args.trials/5376*100:.1f}% coverage)")
+    print("  use_loc_cat_interaction:   [True, False]")
+    print("Pinned: per-model hyperparams from best known runs; gpu=True; tune=False; bias_correction=True")
+    print(f"Total discrete space: 14,784 combinations (~{args.trials/14784*100:.1f}% coverage)")
     print()
 
     study.optimize(objective, n_trials=args.trials)

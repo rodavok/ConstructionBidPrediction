@@ -15,7 +15,7 @@ Say: "Ready to run. Execute with: `python src/model.py --tune`"
 
 | Argument | Type | Description |
 |----------|------|-------------|
-| `--model` | choice | Model backend: `lightgbm`, `xgboost`, `catboost`, `ridge`, `elasticnet`, `stacking` |
+| `--model` | choice | Model backend: `lightgbm`, `xgboost`, `catboost`, `ridge`, `elasticnet`, `randomforest`, `stacking` |
 | `--tune` | flag | Enable hyperparameter tuning via RandomizedSearchCV |
 | `--tune-iterations` | int | Number of tuning iterations (default: 30) |
 | `--random-cv` | flag | Use random KFold CV instead of time-based CV |
@@ -24,9 +24,11 @@ Say: "Ready to run. Execute with: `python src/model.py --tune`"
 | `--log-inflation` | flag | Log-transform inflation factors (symmetric scale, better for linear models) |
 | `--contractor-history` | flag | Add contractor prior wins count at bid time |
 | `--competition-intensity` | flag | Add number of bidders per job as feature |
+| `--loc-cat-interaction` | flag | Add location × category interaction features: mean, std, and count of log-bid per (location, category) pair, computed from training fold only (no leakage). |
 | `--gpu` | flag | Enable GPU acceleration (CUDA for XGBoost/CatBoost, OpenCL for LightGBM) |
 | `--recency-weight` | float | Exponential decay factor for recency weighting (0=uniform, 1=~37% weight to 1-year-old bids, 2=~14%) |
 | `--markup-ratio` | flag | Predict log(bid/estimated_cost) instead of log(bid); model learns contractor markup. CV RMSE still reported in log-bid space for comparability. |
+| `--bias-correction` | flag | Shift test predictions by the mean OOF residual (log space). Corrects systematic under/over-prediction. OOF bias is always printed and logged to MLflow as `oof_bias` regardless of this flag. |
 | `--train-from` | str | ISO date (e.g. `2022-07-01`). Model trains only on bids from this date onward; price lookup still uses all data for full pay-item coverage. |
 
 ### Default Config

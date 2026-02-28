@@ -29,5 +29,12 @@
   },
   "stacking": {
     "final_estimator__alpha": 17.71884735480682
+  },
+  "randomforest": {
+    "max_depth": 25,
+    "max_features": 0.5,
+    "min_samples_leaf": 1,
+    "min_samples_split": 8,
+    "n_estimators": 720
   }
 }
